@@ -1,0 +1,35 @@
+name: Build ColorOS Port
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_rom:
+        description: 'Link Direct Base ROM (OnePlus 9 Pro)'
+        required: true
+        default: ''
+      port_rom:
+        description: 'Link Direct Port ROM (OnePlus 15)'
+        required: true
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Linux Environment
+        run: |
+          sudo bash setup.sh
+
+      - name: Run Porting Process
+        run: |
+          sudo bash port.sh "${{ github.event.inputs.base_rom }}" "${{ github.event.inputs.port_rom }}"
+
+      - name: Upload Output Zip
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ColorOS_Port_Result
+          path: out/*.zip
