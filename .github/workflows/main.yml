@@ -1,4 +1,4 @@
-name: Build ColorOS
+name: Build ColorOS Port
 
 on:
   workflow_dispatch:
@@ -15,63 +15,43 @@ jobs:
 
       - name: Free Disk Space
         run: |
-          echo "==> Membersihkan ruang cakera pelayan GitHub..."
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force > /dev/null 2>&1
           df -h
 
       - name: Install Dependencies
         run: |
-          echo "==> Memasang alat sokongan Linux, xmlstarlet, aria2 & uv..."
           sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 p7zip-full unace zip unzip lzop git xmlstarlet
+          sudo apt-get install -y -qq aria2 p7zip-full unace zip unzip lzop git xmlstarlet python3 openjdk-11-jre-headless
           pip3 install --upgrade uv --break-system-packages || pip install --upgrade uv
 
       - name: Download ROMs
         run: |
-          echo "=========================================="
-          echo "==> [1/2] Menyedut Base ROM (ColorOS 14) dari Pixeldrain..."
-          echo "=========================================="
           aria2c -x 8 -s 8 -k 1M --timeout=30 --max-tries=5 \
-            -o c14Op9p_qcom.zip "https://pixeldrain.com/api/file/6tWiZsAy"
+            -o "Copy of c14Op9p_qcom.zip" "https://pixeldrain.com/u/6tWiZsAy"
 
-          echo "=========================================="
-          echo "==> [2/2] Menyedut Donor ROM (ColorOS 17 - 10.2GB) dari GoFile..."
-          echo "=========================================="
           git clone https://github.com/ltsdw/gofile-downloader.git
           uv run gofile-downloader/gofile-downloader.py "https://gofile.io/d/PXMZheo2"
 
-          echo "==> Mengesan dan memindahkan fail ColorOS 17..."
-          find . -maxdepth 3 -type f -name "*c17*.zip" ! -name "c17Op15_qcom.zip" -exec mv -v {} ./c17Op15_qcom.zip \;
+          mv -v "Copy of c14Op9p_qcom.zip" c14Op9p_qcom.zip || true
+          find . -maxdepth 3 -type f -name "Copy of c17Op15_qcom.zip" -exec mv -v {} ./c17Op15_qcom.zip \;
           rm -rf gofile-downloader downloads
 
-          echo "=========================================="
-          echo "==> Semakan Integriti Arkib ROM Sedia Ada:"
-          echo "=========================================="
-          ls -lh *.zip
+          ls -lh c14Op9p_qcom.zip c17Op15_qcom.zip
+          sha256sum c14Op9p_qcom.zip c17Op15_qcom.zip
+
+      - name: Clean Build Cache
+        run: rm -rf build/* output/* out/*
 
       - name: Run Porting Process
         run: |
-          echo "==> Menjalankan persediaan persekitaran (setup.sh)..."
           if [ -f "./setup.sh" ]; then
             chmod +x ./setup.sh
-            sudo ./setup.sh
+            ./setup.sh
           fi
-
-          echo "==> Memulakan skrip porting ROM..."
-          if [ -f "./port.sh" ]; then
-            chmod +x ./port.sh
-            sudo ./port.sh
-          elif [ -f "./make.sh" ]; then
-            chmod +x ./make.sh
-            sudo ./make.sh
-          else
-            echo "[!] Skrip port.sh / make.sh tidak dijumpai, menjalankan skrip Python utama..."
-            python3 main.py || python3 port.py || true
-          fi
+          chmod +x ./port.sh
+          ./port.sh c14Op9p_qcom.zip c17Op15_qcom.zip
+          rm -f c14Op9p_qcom.zip c17Op15_qcom.zip
 
       - name: Upload Output Zip
         uses: actions/upload-artifact@v4
@@ -80,5 +60,4 @@ jobs:
           path: |
             output/*.zip
             out/*.zip
-            *.zip
-          if-no-files-found: warn
+          if-no-files-found: error
