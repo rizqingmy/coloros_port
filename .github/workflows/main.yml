@@ -3,77 +3,145 @@ name: Build ColorOS Port
 on:
   workflow_dispatch:
   push:
-    branches: [ main, COS16/OOS16 ]
+    branches:
+      - main
+      - COS16/OOS16
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
 
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Free Disk Space
+      - name: Free Disk Space & Check Storage
         run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force > /dev/null 2>&1
-          df -h
+          echo "==> Initial storage"
+          df -h /
+
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache
+          sudo rm -rf /usr/local/share/powershell
+          sudo rm -rf /usr/local/share/chromium
+
+          sudo docker image prune -af || true
+
+          echo "==> Storage after cleanup"
+          df -h /
 
       - name: Install Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 p7zip-full unace zip unzip lzop git xmlstarlet python3 openjdk-11-jre-headless jq
-          pip3 install --upgrade uv --break-system-packages || pip install --upgrade uv
+
+          sudo apt-get install -y -qq \
+            aria2 \
+            p7zip-full \
+            unace \
+            zip \
+            unzip \
+            lzop \
+            git \
+            xmlstarlet \
+            python3 \
+            python3-pip \
+            openjdk-11-jre-headless
+
+          pip3 install --upgrade uv --break-system-packages || true
 
       - name: Download ROMs
         run: |
-          TOKEN="y3jCpIatp2dgChcB8Iwx9aLyhx9C9s1i"
-
-          echo "==> Downloading Base ROM (ColorOS 14 OnePlus 9 Pro)..."
-          aria2c -x 16 -s 16 -k 1M --timeout=30 --max-tries=5 \
-            --header="Cookie: accountToken=${TOKEN}" \
+          echo "==> Downloading Base ROM"
+          aria2c \
+            -x16 -s16 -k1M \
+            --summary-interval=5 \
+            --retry-wait=5 \
+            --max-tries=20 \
+            --continue=true \
             -o c14Op9p_qcom.zip \
-            "https://store-na-phx-3.gofile.io/download/web/7dc85f78-92bb-4ca5-83b2-86555ba3ba00/c14Op9p_qcom.zip"
+            "https://huggingface.co/rizqingsenpai/coloros\_port\_roms/resolve/main/c14Op9p\_qcom.zip"
 
-          echo "==> Downloading Donor ROM (ColorOS 17 OnePlus 15)..."
-          aria2c -x 16 -s 16 -k 1M --timeout=30 --max-tries=5 \
-            --header="Cookie: accountToken=${TOKEN}" \
+          echo "==> Downloading Donor ROM"
+          aria2c \
+            -x16 -s16 -k1M \
+            --summary-interval=5 \
+            --retry-wait=5 \
+            --max-tries=20 \
+            --continue=true \
             -o c17Op15_qcom.zip \
-            "https://store-na-phx-5.gofile.io/download/web/513e0a71-79ea-4b95-8dcd-225c07c02693/c17Op15_qcom.zip"
+            "https://huggingface.co/rizqingsenpai/coloros\_port\_roms/resolve/main/c17Op15\_qcom.zip"
 
-          echo "==> Verifying ROM files..."
+          echo "==> Verify downloaded files"
           ls -lh c14Op9p_qcom.zip c17Op15_qcom.zip
-          sha256sum c14Op9p_qcom.zip c17Op15_qcom.zip
 
-          # Fail early if downloads are incomplete
           test $(stat -c%s c14Op9p_qcom.zip) -gt 1000000000 || (echo "Base ROM too small!" && exit 1)
           test $(stat -c%s c17Op15_qcom.zip) -gt 1000000000 || (echo "Donor ROM too small!" && exit 1)
 
-      - name: Debug Partition Config
+          echo "==> Storage after downloads"
+          df -h /
+
+      - name: Show Port Config
         run: |
-          echo "==> Partitions to port:"
-          grep "partition_to_port" bin/port_config
-          echo "==> Possible super partitions:"
-          grep "possible_super_list" bin/port_config
+          echo "==> Partitions"
+          grep partition_to_port bin/port_config || true
+
+          echo "==> Super list"
+          grep possible_super_list bin/port_config || true
 
       - name: Clean Build Cache
-        run: rm -rf build/* output/* out/*
-
-      - name: Run Porting Process
         run: |
-          if [ -f "./setup.sh" ]; then
-            chmod +x ./setup.sh
+          rm -rf build
+          rm -rf output
+          rm -rf out
+
+          mkdir -p build
+          mkdir -p output
+          mkdir -p out
+
+      - name: Storage Before Porting
+        run: |
+          df -h /
+
+      - name: Run Setup
+        run: |
+          if [ -f setup.sh ]; then
+            chmod +x setup.sh
             ./setup.sh
           fi
-          chmod +x ./port.sh
+
+      - name: Run Port Script
+        run: |
+          chmod +x port.sh
           ./port.sh c14Op9p_qcom.zip c17Op15_qcom.zip
-          rm -f c14Op9p_qcom.zip c17Op15_qcom.zip
+
+      - name: Remove Source ROMs
+        if: always()
+        run: |
+          rm -f c14Op9p_qcom.zip
+          rm -f c17Op15_qcom.zip
+
+      - name: Storage After Porting
+        if: always()
+        run: |
+          df -h /
+
+      - name: Show Output Files
+        if: always()
+        run: |
+          echo "==> Output directory"
+          find output -type f 2>/dev/null || true
+
+          echo "==> Out directory"
+          find out -type f 2>/dev/null || true
 
       - name: Upload Output Zip
         uses: actions/upload-artifact@v4
         with:
           name: ColorOS17_OnePlus9Pro_Port
           path: |
-            output/*.zip
-            out/*.zip
+            output/**/*.zip
+            out/**/*.zip
           if-no-files-found: error
