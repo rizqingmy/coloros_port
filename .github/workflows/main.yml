@@ -25,7 +25,7 @@ jobs:
       - name: Setup Linux Environment
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y python3-pip p7zip-full aria2 liblzma-dev brotli zstd curl xmlstarlet
+          sudo apt-get install -y python3-pip p7zip-full aria2 liblzma-dev brotli zstd curl xmlstarlet wget
           pip3 install --upgrade gdown
 
       - name: Download ROMs with gdown
@@ -42,6 +42,14 @@ jobs:
           if [ -f setup.sh ]; then
             sudo bash setup.sh
           fi
+
+          # Kemas kini Apktool ke versi moden untuk sokong ARSC ColorOS 17
+          echo "==> Mengemas kini Apktool..."
+          wget -q -O /tmp/apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
+          find . -name "apktool*.jar" -exec cp -fv /tmp/apktool.jar {} \;
+          sudo cp -fv /tmp/apktool.jar /usr/local/bin/apktool.jar 2>/dev/null || true
+          sudo cp -fv /tmp/apktool.jar /usr/bin/apktool.jar 2>/dev/null || true
+
           sudo bash port.sh c14Op9p_qcom.zip c17Op15_qcom.zip
 
       - name: Upload Output Zip
