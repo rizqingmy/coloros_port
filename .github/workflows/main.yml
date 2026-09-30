@@ -22,18 +22,24 @@ jobs:
       - name: Install Dependencies
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 p7zip-full unace zip unzip lzop git xmlstarlet python3 openjdk-11-jre-headless
+          sudo apt-get install -y -qq aria2 p7zip-full unace zip unzip lzop git xmlstarlet python3 openjdk-11-jre-headless jq
           pip3 install --upgrade uv --break-system-packages || pip install --upgrade uv
 
       - name: Download ROMs
         run: |
+          TOKEN="y3jCpIatp2dgChcB8Iwx9aLyhx9C9s1i"
+
           echo "==> Downloading Base ROM (ColorOS 14 OnePlus 9 Pro)..."
-          aria2c -x 8 -s 8 -k 1M --timeout=30 --max-tries=5 \
-            -o c14Op9p_qcom.zip "https://gofile.io/d/dUIAOm04"
+          aria2c -x 16 -s 16 -k 1M --timeout=30 --max-tries=5 \
+            --header="Cookie: accountToken=${TOKEN}" \
+            -o c14Op9p_qcom.zip \
+            "https://store-na-phx-3.gofile.io/download/web/7dc85f78-92bb-4ca5-83b2-86555ba3ba00/c14Op9p_qcom.zip"
 
           echo "==> Downloading Donor ROM (ColorOS 17 OnePlus 15)..."
-          aria2c -x 8 -s 8 -k 1M --timeout=30 --max-tries=5 \
-            -o c17Op15_qcom.zip "https://gofile.io/d/powVyH62"
+          aria2c -x 16 -s 16 -k 1M --timeout=30 --max-tries=5 \
+            --header="Cookie: accountToken=${TOKEN}" \
+            -o c17Op15_qcom.zip \
+            "https://store-na-phx-5.gofile.io/download/web/513e0a71-79ea-4b95-8dcd-225c07c02693/c17Op15_qcom.zip"
 
           echo "==> Verifying ROM files..."
           ls -lh c14Op9p_qcom.zip c17Op15_qcom.zip
