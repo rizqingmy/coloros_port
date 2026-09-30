@@ -16,7 +16,7 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      - name: Free Disk Space & Check Storage
+      - name: Free Disk Space
         run: |
           echo "==> Initial storage"
           df -h /
@@ -30,7 +30,7 @@ jobs:
 
           sudo docker image prune -af || true
 
-          echo "==> Storage after cleanup"
+          echo "==> After cleanup"
           df -h /
 
       - name: Install Dependencies
@@ -38,7 +38,6 @@ jobs:
           sudo apt-get update -qq
 
           sudo apt-get install -y -qq \
-            aria2 \
             p7zip-full \
             unace \
             zip \
@@ -50,32 +49,30 @@ jobs:
             python3-pip \
             openjdk-11-jre-headless
 
-          pip3 install --upgrade uv --break-system-packages || true
+          pip3 install -U huggingface_hub hf_xet
 
-      - name: Download ROMs
+      - name: Download ROMs From Hugging Face
         run: |
-          echo "==> Downloading Base ROM"
-          aria2c \
-            -x16 -s16 -k1M \
-            --summary-interval=5 \
-            --retry-wait=5 \
-            --max-tries=20 \
-            --continue=true \
-            -o c14Op9p_qcom.zip \
-            "https://huggingface.co/rizqingsenpai/coloros\_port\_roms/resolve/main/c14Op9p\_qcom.zip"
+          python3 << 'PY'
+          from huggingface_hub import hf_hub_download
 
-          echo "==> Downloading Donor ROM"
-          aria2c \
-            -x16 -s16 -k1M \
-            --summary-interval=5 \
-            --retry-wait=5 \
-            --max-tries=20 \
-            --continue=true \
-            -o c17Op15_qcom.zip \
-            "https://huggingface.co/rizqingsenpai/coloros\_port\_roms/resolve/main/c17Op15\_qcom.zip"
+          print("Downloading Base ROM...")
+          hf_hub_download(
+              repo_id="rizqingsenpai/coloros_port_roms",
+              filename="c14Op9p_qcom.zip",
+              local_dir="."
+          )
 
-          echo "==> Verify downloaded files"
-          ls -lh c14Op9p_qcom.zip c17Op15_qcom.zip
+          print("Downloading Donor ROM...")
+          hf_hub_download(
+              repo_id="rizqingsenpai/coloros_port_roms",
+              filename="c17Op15_qcom.zip",
+              local_dir="."
+          )
+          PY
+
+          echo "==> Verify downloads"
+          ls -lh *.zip
 
           test $(stat -c%s c14Op9p_qcom.zip) -gt 1000000000 || (echo "Base ROM too small!" && exit 1)
           test $(stat -c%s c17Op15_qcom.zip) -gt 1000000000 || (echo "Donor ROM too small!" && exit 1)
@@ -85,25 +82,13 @@ jobs:
 
       - name: Show Port Config
         run: |
-          echo "==> Partitions"
           grep partition_to_port bin/port_config || true
-
-          echo "==> Super list"
           grep possible_super_list bin/port_config || true
 
       - name: Clean Build Cache
         run: |
-          rm -rf build
-          rm -rf output
-          rm -rf out
-
-          mkdir -p build
-          mkdir -p output
-          mkdir -p out
-
-      - name: Storage Before Porting
-        run: |
-          df -h /
+          rm -rf build output out
+          mkdir -p build output out
 
       - name: Run Setup
         run: |
@@ -123,18 +108,14 @@ jobs:
           rm -f c14Op9p_qcom.zip
           rm -f c17Op15_qcom.zip
 
-      - name: Storage After Porting
+      - name: Output Debug
         if: always()
         run: |
+          echo "==> Storage"
           df -h /
 
-      - name: Show Output Files
-        if: always()
-        run: |
-          echo "==> Output directory"
+          echo "==> Output files"
           find output -type f 2>/dev/null || true
-
-          echo "==> Out directory"
           find out -type f 2>/dev/null || true
 
       - name: Upload Output Zip
