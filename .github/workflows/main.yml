@@ -29,14 +29,16 @@ jobs:
           pip3 install --upgrade gdown
 
       - name: Download ROMs with gdown
+            - name: Download ROMs with gdown
         run: |
           echo "==> Memuat turun Base ROM (OnePlus 9 Pro)..."
-          gdown --id 1fgIy5-4Yd-nzPe3QsuXzX-4L_cVDhv3y -O c14Op9p_qcom.zip
+          gdown 1fgIy5-4Yd-nzPe3QsuXzX-4L_cVDhv3y -O c14Op9p_qcom.zip
           
           echo "==> Memuat turun Donor ROM (ColorOS 17)..."
-          gdown --id 1LAnsDY87ktD2NzENQ3OWMtEBpEscRLV3 -O c17Op15_qcom.zip
+          gdown 1LAnsDY87ktD2NzENQ3OWMtEBpEscRLV3 -O c17Op15_qcom.zip
           
           ls -lh *.zip
+
 
       - name: Run Porting Process
         run: |
