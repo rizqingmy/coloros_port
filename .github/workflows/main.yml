@@ -1,4 +1,4 @@
-name: Build ColorOS Port
+name: Build ColorOS
 
 on:
   workflow_dispatch:
@@ -42,10 +42,11 @@ jobs:
           echo "==> [2/2] Menyedut Donor ROM (ColorOS 17 - 10.2GB) dari GoFile..."
           echo "=========================================="
           git clone https://github.com/ltsdw/gofile-downloader.git
-          mkdir -p downloads
-          GF_DOWNLOAD_DIR="./downloads" GF_INTERACTIVE="0" uv run gofile-downloader/gofile-downloader.py "https://gofile.io/d/PXMZheo2"
-          mv downloads/*c17*.zip ./c17Op15_qcom.zip || mv downloads/*.zip ./c17Op15_qcom.zip
-          rm -rf downloads gofile-downloader
+          uv run gofile-downloader/gofile-downloader.py "https://gofile.io/d/PXMZheo2"
+
+          echo "==> Mengesan dan memindahkan fail ColorOS 17..."
+          find . -maxdepth 3 -type f -name "*c17*.zip" ! -name "c17Op15_qcom.zip" -exec mv -v {} ./c17Op15_qcom.zip \;
+          rm -rf gofile-downloader downloads
 
           echo "=========================================="
           echo "==> Semakan Integriti Arkib ROM Sedia Ada:"
