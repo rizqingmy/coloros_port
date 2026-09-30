@@ -25,9 +25,9 @@ jobs:
 
       - name: Install Dependencies
         run: |
-          echo "==> Memasang alat sokongan Linux, aria2 & uv..."
+          echo "==> Memasang alat sokongan Linux, xmlstarlet, aria2 & uv..."
           sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 p7zip-full unace zip unzip lzop git
+          sudo apt-get install -y -qq aria2 p7zip-full unace zip unzip lzop git xmlstarlet
           pip3 install --upgrade uv --break-system-packages || pip install --upgrade uv
 
       - name: Download ROMs
@@ -55,13 +55,19 @@ jobs:
 
       - name: Run Porting Process
         run: |
+          echo "==> Menjalankan persediaan persekitaran (setup.sh)..."
+          if [ -f "./setup.sh" ]; then
+            chmod +x ./setup.sh
+            sudo ./setup.sh
+          fi
+
           echo "==> Memulakan skrip porting ROM..."
           if [ -f "./port.sh" ]; then
             chmod +x ./port.sh
-            ./port.sh
+            sudo ./port.sh
           elif [ -f "./make.sh" ]; then
             chmod +x ./make.sh
-            ./make.sh
+            sudo ./make.sh
           else
             echo "[!] Skrip port.sh / make.sh tidak dijumpai, menjalankan skrip Python utama..."
             python3 main.py || python3 port.py || true
