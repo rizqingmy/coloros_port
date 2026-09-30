@@ -27,4 +27,47 @@ jobs:
 
       - name: Download ROMs
         run: |
-          echo "==> Downloading Base ROM (Color
+          echo "==> Downloading Base ROM (ColorOS 14 OnePlus 9 Pro)..."
+          aria2c -x 8 -s 8 -k 1M --timeout=30 --max-tries=5 \
+            -o c14Op9p_qcom.zip "https://gofile.io/d/dUIAOm04"
+
+          echo "==> Downloading Donor ROM (ColorOS 17 OnePlus 15)..."
+          aria2c -x 8 -s 8 -k 1M --timeout=30 --max-tries=5 \
+            -o c17Op15_qcom.zip "https://gofile.io/d/powVyH62"
+
+          echo "==> Verifying ROM files..."
+          ls -lh c14Op9p_qcom.zip c17Op15_qcom.zip
+          sha256sum c14Op9p_qcom.zip c17Op15_qcom.zip
+
+          # Fail early if downloads are incomplete
+          test $(stat -c%s c14Op9p_qcom.zip) -gt 1000000000 || (echo "Base ROM too small!" && exit 1)
+          test $(stat -c%s c17Op15_qcom.zip) -gt 1000000000 || (echo "Donor ROM too small!" && exit 1)
+
+      - name: Debug Partition Config
+        run: |
+          echo "==> Partitions to port:"
+          grep "partition_to_port" bin/port_config
+          echo "==> Possible super partitions:"
+          grep "possible_super_list" bin/port_config
+
+      - name: Clean Build Cache
+        run: rm -rf build/* output/* out/*
+
+      - name: Run Porting Process
+        run: |
+          if [ -f "./setup.sh" ]; then
+            chmod +x ./setup.sh
+            ./setup.sh
+          fi
+          chmod +x ./port.sh
+          ./port.sh c14Op9p_qcom.zip c17Op15_qcom.zip
+          rm -f c14Op9p_qcom.zip c17Op15_qcom.zip
+
+      - name: Upload Output Zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ColorOS17_OnePlus9Pro_Port
+          path: |
+            output/*.zip
+            out/*.zip
+          if-no-files-found: error
