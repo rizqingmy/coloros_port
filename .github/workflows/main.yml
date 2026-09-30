@@ -1,4 +1,4 @@
-Name: Build ColorOS
+name: Build ColorOS
 
 on:
   workflow_dispatch:
