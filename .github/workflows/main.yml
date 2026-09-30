@@ -33,9 +33,9 @@ jobs:
       - name: Download ROMs
         run: |
           echo "=========================================="
-          echo "==> [1/3] Memuat turun Base ROM (ColorOS 14)..."
+          echo "==> [1/3] Memuat turun Base ROM (ColorOS 14) dari Pixeldrain..."
           echo "=========================================="
-          gdown 1hS1lH0L-e-lVsVN41ZAuWh69_D8kTz9q -O c14Op9p_qcom.zip
+          wget -q --show-progress -O c14Op9p_qcom.zip https://pixeldrain.com/api/file/6tWiZsAy
 
           echo "=========================================="
           echo "==> [2/3] Memuat turun Donor ROM (ColorOS 17) dari Pixeldrain..."
