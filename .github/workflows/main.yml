@@ -22,11 +22,27 @@ jobs:
           sudo rm -f /mnt/swapfile
           df -h /
 
-      - name: Setup Linux Environment
+            - name: Setup Linux Environment
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y python3-pip p7zip-full aria2 liblzma-dev brotli zstd curl
+          sudo apt-get install -y python3-pip p7zip-full aria2 liblzma-dev brotli zstd curl xmlstarlet
           pip3 install --upgrade gdown
+
+      - name: Download ROMs with gdown
+        run: |
+          echo "==> Memuat turun Base ROM (OnePlus 9 Pro)..."
+          gdown 1fgIy5-4Yd-nzPe3QsuXzX-4L_cVDhv3y -O c14Op9p_qcom.zip
+          echo "==> Memuat turun Donor ROM (ColorOS 17)..."
+          gdown 1LAnsDY87ktD2NzENQ3OWMtEBpEscRLV3 -O c17Op15_qcom.zip
+          ls -lh *.zip
+
+      - name: Run Porting Process
+        run: |
+          chmod -R +x .
+          if [ -f setup.sh ]; then
+            sudo bash setup.sh
+          fi
+          sudo bash port.sh c14Op9p_qcom.zip c17Op15_qcom.zip
 
       - name: Download ROMs with gdown
         run: |
