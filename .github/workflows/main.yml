@@ -30,10 +30,10 @@ jobs:
 
       - name: Download ROMs with gdown
         run: |
-          echo "==> Memuat turun Base ROM (OnePlus 9 Pro)..."
-          gdown 1fgIy5-4Yd-nzPe3QsuXzX-4L_cVDhv3y -O c14Op9p_qcom.zip
+          echo "==> Memuat turun Base ROM (OnePlus 9 Pro - ColorOS 14)..."
+          gdown 1Q1JSNRnLsRMVUMGO5Ys4C0p2RcCCOIg2 -O c14Op9p_qcom.zip
           echo "==> Memuat turun Donor ROM (ColorOS 17)..."
-          gdown 1LAnsDY87ktD2NzENQ3OWMtEBpEscRLV3 -O c17Op15_qcom.zip
+          gdown 1OtSMYozKRV1K4XjtXlL9kkLx_Qll6ZXL -O c17Op15_qcom.zip
           ls -lh *.zip
 
       - name: Run Porting Process
@@ -43,7 +43,7 @@ jobs:
             sudo bash setup.sh
           fi
 
-          # Kemas kini Apktool ke versi moden untuk sokong ARSC ColorOS 17
+          # Kemas kini Apktool ke v2.10.0 untuk elak ralat ARSC ColorOS 17
           echo "==> Mengemas kini Apktool..."
           wget -q -O /tmp/apktool.jar https://github.com/iBotPeaches/Apktool/releases/download/v2.10.0/apktool_2.10.0.jar
           find . -name "apktool*.jar" -exec cp -fv /tmp/apktool.jar {} \;
