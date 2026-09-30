@@ -2,15 +2,6 @@ name: Build ColorOS Port
 
 on:
   workflow_dispatch:
-    inputs:
-      base_rom:
-        description: 'Link Direct Base ROM (OnePlus 9 Pro)'
-        required: true
-        default: ''
-      port_rom:
-        description: 'Link Direct Port ROM (OnePlus 15)'
-        required: true
-        default: ''
 
 jobs:
   build:
@@ -19,17 +10,46 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
 
+      - name: Free Disk Space (Kosongkan 45GB Ruang)
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/share/boost
+          sudo docker image prune --all --force
+          sudo swapoff -a
+          sudo rm -f /mnt/swapfile
+          df -h /
+
       - name: Setup Linux Environment
         run: |
-          sudo bash setup.sh
+          sudo apt-get update -y
+          sudo apt-get install -y python3-pip p7zip-full aria2 liblzma-dev brotli zstd curl
+          pip3 install --upgrade gdown
+
+      - name: Download ROMs with gdown
+        run: |
+          echo "==> Memuat turun Base ROM (OnePlus 9 Pro)..."
+          gdown --id 1fgIy5-4Yd-nzPe3QsuXzX-4L_cVDhv3y -O c14Op9p_qcom.zip
+          
+          echo "==> Memuat turun Donor ROM (ColorOS 17)..."
+          gdown --id 1LAnsDY87ktD2NzENQ3OWMtEBpEscRLV3 -O c17Op15_qcom.zip
+          
+          ls -lh *.zip
 
       - name: Run Porting Process
         run: |
-          sudo bash port.sh "${{ github.event.inputs.base_rom }}" "${{ github.event.inputs.port_rom }}"
+          chmod -R +x .
+          sudo bash port.sh c14Op9p_qcom.zip c17Op15_qcom.zip
 
       - name: Upload Output Zip
-        uses: actions/upload-artifact@v4
         if: always()
-        with:
-          name: ColorOS_Port_Result
-          path: out/*.zip
+        run: |
+          OUTPUT_ZIP=$(find . -maxdepth 2 -name "*output*.zip" -o -name "*port*.zip" | grep -v "c14" | grep -v "c17" | head -n 1)
+          if [ -n "$OUTPUT_ZIP" ]; then
+            echo "Memuat naik $OUTPUT_ZIP..."
+            curl -F "file=@$OUTPUT_ZIP" https://store1.gofile.io/uploadFile
+          else
+            echo "Tiada fail output baharu ditemui."
+          fi
