@@ -110,6 +110,15 @@ jobs:
           # Bersihkan cache framework lama jika ada
           rm -rf ~/.local/share/apktool/framework/ || true
 
+      - name: Setup Android Signing Keys
+        run: |
+          echo "==> Setting up signing keys..."
+          mkdir -p key bin/key
+          wget -q -O key/testkey.x509.pem https://raw.githubusercontent.com/aosp-mirror/platform_build/master/target/product/security/testkey.x509.pem || true
+          wget -q -O key/testkey.pk8 https://raw.githubusercontent.com/aosp-mirror/platform_build/master/target/product/security/testkey.pk8 || true
+          cp -r key/* bin/key/ 2>/dev/null || true
+          ls -lh key/
+
       - name: Run Port Script
         run: |
           chmod +x port.sh
