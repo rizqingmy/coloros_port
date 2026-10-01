@@ -47,7 +47,8 @@ jobs:
             xmlstarlet \
             python3 \
             python3-pip \
-            openjdk-11-jre-headless
+            openjdk-11-jre-headless \
+            wget
 
           pip3 install -U huggingface_hub hf_xet
 
@@ -96,6 +97,18 @@ jobs:
             chmod +x setup.sh
             ./setup.sh
           fi
+
+      - name: Update Apktool
+        run: |
+          echo "==> Updating Apktool to v2.11.1..."
+          mkdir -p bin/apktool
+          wget -q -O bin/apktool/apktool.jar \
+            https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar
+          chmod +x bin/apktool/apktool.jar
+          ls -lh bin/apktool/apktool.jar
+
+          # Bersihkan cache framework lama jika ada
+          rm -rf ~/.local/share/apktool/framework/ || true
 
       - name: Run Port Script
         run: |
