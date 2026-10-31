@@ -1,6 +1,7 @@
 # 需要移植的分区
 partition_to_port=system,system_ext,product,my_product,my_engineering,my_stock,my_heytap,my_carrier,my_region,my_bigball,my_manifest,my_company,my_preload
 
+
 # 可能的super子分区列表
 possible_super_list=system system_ext vendor product my_product odm my_engineering vendor_dlkm system_dlkm my_stock my_heytap my_carrier my_region my_bigball my_manifest my_company my_preload
 
@@ -14,4 +15,24 @@ remove_data_encryption=false
 
 # Needed to manually extend super partition, in order to flash it successfully. 
 super_extended=false
+
+pack_with_dsu=false
+
 pack_method=stock
+
+#ddr_type=ddr5
+
+#给其他机型移植时，已近处理过的包，可以复用，不用再处理。
+
+reusabe_partition_list=my_bigball my_heytap my_stock my_region product
+
+# 启用 KernelSU 支持 (需要 init_boot 分区)
+# Enable KernelSU support (requires init_boot partition)
+# KernelSU is opt-in. Enabling it changes boot images and adds root
+# capabilities; use an explicit environment/device override when required.
+enable_ksu=false
+
+# KernelSU GitHub 仓库配置 (可选)
+# KernelSU GitHub repository configuration (optional)
+# ksu_repo_owner=tiann
+# ksu_repo_name=KernelSU

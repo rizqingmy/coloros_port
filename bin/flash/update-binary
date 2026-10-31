@@ -1,5 +1,11 @@
 #!/sbin/sh
-ui_print() { $BOOTMODE && echo "$1" || echo -e "ui_print $1\nui_print" >> $OUTFD; }
+ui_print() {
+  if [ "${BOOTMODE:-false}" = true ]; then
+    echo "$1"
+  else
+    echo -e "ui_print $1\nui_print" >> "$OUTFD"
+  fi
+}
 abort() { ui_print "$1"; ui_print " "; exit 1; }
 OUTFD=/proc/self/fd/$2
 ZIPFILE="$3"
@@ -7,57 +13,116 @@ tmp=/dev/tmp
 
 
 set -x
-rm -rf $tmp
-mkdir -p $tmp
+rm -rf "$tmp"
+mkdir -p "$tmp" || abort "Unable to prepare temporary directory"
+
+package_has_file() {
+  unzip -l "$ZIPFILE" "$1" 2>/dev/null | awk -v entry="$1" '$NF == entry { found = 1 } END { exit !found }'
+}
+
+require_package_file() {
+  package_has_file "$1" || abort "Required package file is missing: $1"
+}
+
+require_partition() {
+  [ -e "$1" ] || abort "Required partition is unavailable: $1"
+}
 
 package_extract_file() {
-  ui_print "- 正在刷写分区 $(echo $2 | cut -d '/' -f 6) "
-  unzip -p "$ZIPFILE" $1 >$2
+  entry="$1"
+  target="$2"
+  if ! package_has_file "$entry"; then
+    ui_print "- Skipping missing optional image: $entry"
+    return 0
+  fi
+  if [ ! -e "$target" ]; then
+    ui_print "- Skipping unavailable optional partition: $target"
+    return 0
+  fi
+  unzip -p "$ZIPFILE" "$entry" > "$target" || abort "Failed to flash $entry to $target"
 }
 
 package_extract_zstd() {
-  ui_print "- 正在刷写分区 $(echo $2 | cut -d '/' -f 6) "
-  unzip -p "$ZIPFILE" $1 | /dev/tmp/META-INF/zstd -c -d >$2
+  ui_print "- Flashing $(basename "$2")"
+  unzip -p "$ZIPFILE" "$1" | /dev/tmp/META-INF/zstd -c -d > "$2" || abort "Failed to decompress or flash $1"
 }
-
-# Device check
-supported=false
-ui_print "Checking device compatibility..."
-for i in 19805 20809 20828; do
-  for prop in "ro.boot.prjname" "ro.boot.project_name"; do
-    if [ "$(getprop $prop)" == "$i" ]; then
-      ui_print "- Supported Device detected"
-      supported=true
-      break 2
-    fi
-  done
-done
-$supported || abort "- Unsupported device! Aborting!"
 
 ddr4=false
 ddr5=false
-ui_print "Checking RAM type..."
-if [ "$(cat /proc/devinfo/ddr_type | grep -i DDR4)" ]; then
-  ddr4=true
-  ui_print "- DDR4 RAM detected!"
-elif [ "$(cat /proc/devinfo/ddr_type | grep -i DDR5)" ]; then
-  ddr5=true
-  ui_print "- DDR5 RAM detected!"
-elif [ "$(getprop ro.boot.ddr_type | grep -i 0)" ]; then
-  ddr4=true
-  ui_print "- DDR4 RAM detected!"
-elif [ "$(getprop ro.boot.ddr_type | grep -i 1)" ]; then
-  ddr5=true
-  ui_print "- DDR5 RAM detected!"
-else  ui_print "- Could not detect RAM type. Flashing aborted!" 
-  exit 0
+
+# Refuse to flash a package onto an unrelated device. Some recoveries expose
+# only one of these product properties, so accept a match from any available
+# product property or the bootloader project identifier.
+expected_device="device_code"
+expected_project="PROJECT_CODE"
+device_matches=false
+for property in ro.product.device ro.build.product ro.product.vendor.device ro.product.odm.device; do
+  current_device="$(getprop "$property" 2>/dev/null)"
+  if [ -n "$current_device" ] && [ "$current_device" = "$expected_device" ]; then
+    device_matches=true
+  fi
+done
+current_project="$(getprop ro.boot.prjname 2>/dev/null)"
+[ -n "$current_project" ] || current_project="$(getprop ro.boot.project_name 2>/dev/null)"
+if [ -n "$expected_project" ] && [ "$current_project" = "$expected_project" ]; then
+  device_matches=true
+fi
+[ -n "$expected_device" ] && [ "$expected_device" != "device_code" ] || abort "Package device identity was not generated"
+[ "$device_matches" = true ] || abort "Package is for $expected_device; this device does not match"
+
+# Validate the archive before opening any block device for writing.
+unzip -t "$ZIPFILE" >/dev/null 2>&1 || abort "Package archive validation failed"
+
+# Select and validate the boot image pair before touching firmware partitions.
+if [[ "$ZIPFILE" == *ROOT* ]]; then
+  boot_image="boot_tv.img"
+  dtbo_image="firmware-update/dtbo_tv.img"
+else
+  boot_image="boot_official.img"
+  dtbo_image="firmware-update/dtbo.img"
+fi
+require_package_file "$boot_image"
+require_package_file "$dtbo_image"
+require_package_file "super.zst"
+require_package_file "META-INF/zstd"
+require_partition "/dev/block/bootdevice/by-name/boot_a"
+require_partition "/dev/block/bootdevice/by-name/boot_b"
+require_partition "/dev/block/bootdevice/by-name/dtbo_a"
+require_partition "/dev/block/bootdevice/by-name/dtbo_b"
+require_partition "/dev/block/bootdevice/by-name/super"
+
+# Extract the decompressor before any partition writes.
+mkdir -p /dev/tmp/META-INF || abort "Unable to prepare decompressor directory"
+unzip -p "$ZIPFILE" "META-INF/zstd" > /dev/tmp/META-INF/zstd || abort "Unable to extract zstd"
+chmod 0755 /dev/tmp/META-INF/zstd || abort "Unable to prepare zstd"
+
+# Only older devices with LP5-specific XBL images need RAM-type detection.
+if package_has_file "firmware-update/xbl_lp5.img"; then
+  require_package_file "firmware-update/xbl_config_lp5.img"
+  ui_print "Checking RAM type..."
+  ddr_type="$(cat /proc/devinfo/ddr_type 2>/dev/null)"
+  if printf '%s\n' "$ddr_type" | grep -qi DDR4; then
+    ddr4=true
+    ui_print "- DDR4 RAM detected!"
+  elif printf '%s\n' "$ddr_type" | grep -qi DDR5; then
+    ddr5=true
+    ui_print "- DDR5 RAM detected!"
+  else
+    case "$(getprop ro.boot.ddr_type 2>/dev/null)" in
+      0) ddr4=true; ui_print "- DDR4 RAM detected!" ;;
+      1) ddr5=true; ui_print "- DDR5 RAM detected!" ;;
+      *) abort "Unable to detect RAM type required to choose the matching XBL firmware" ;;
+    esac
+  fi
+else
+  require_package_file "firmware-update/xbl.img"
+  require_package_file "firmware-update/xbl_config.img"
 fi
 
 ui_print " "
 ui_print "****************************"
 ui_print "Device: device_code"
-ui_print "Region: CN"
-ui_print "Flashing Firmware..."
+ui_print "Region: REGIONMARK"
 ui_print " "
 ui_print "Updating modem..."
 package_extract_file "firmware-update/modem.img" "/dev/block/bootdevice/by-name/modem_a"
@@ -109,7 +174,7 @@ package_extract_file "firmware-update/qupfw.img" "/dev/block/bootdevice/by-name/
 ui_print "Updating spunvm..."
 package_extract_file "firmware-update/spunvm.img" "/dev/block/bootdevice/by-name/spunvm"
 ui_print "Updating storsec..."
-package_extract_file "firmware-update/storsec.img" "/dev/block/bootdevice/by-name/storsec_a" 
+package_extract_file "firmware-update/storsec.img" "/dev/block/bootdevice/by-name/storsec_a"
 package_extract_file "firmware-update/storsec.img" "/dev/block/bootdevice/by-name/storsec_b"
 ui_print "Updating tz..."
 package_extract_file "firmware-update/tz.img" "/dev/block/bootdevice/by-name/tz_a"
@@ -117,40 +182,85 @@ package_extract_file "firmware-update/tz.img" "/dev/block/bootdevice/by-name/tz_
 ui_print "Updating uefisecapp..."
 package_extract_file "firmware-update/uefisecapp.img" "/dev/block/bootdevice/by-name/uefisecapp_a"
 package_extract_file "firmware-update/uefisecapp.img" "/dev/block/bootdevice/by-name/uefisecapp_b"
+
 if [ "$ddr4" = "true" ]; then
-   ui_print "Updating xbl for DDR4 RAM..."
-   package_extract_file "firmware-update/xbl.img" "/dev/block/bootdevice/by-name/xbl_a"
-   package_extract_file "firmware-update/xbl.img" "/dev/block/bootdevice/by-name/xbl_b"
-   ui_print "Updating xbl_config for DDR4 RAM..."
-   package_extract_file "firmware-update/xbl_config.img" "/dev/block/bootdevice/by-name/xbl_config_a"
-   package_extract_file "firmware-update/xbl_config.img" "/dev/block/bootdevice/by-name/xbl_config_b" 
-elif  [ "$ddr5" = "true" ]; then
-   ui_print "Updating xbl for DDR5 RAM..."
-   package_extract_file "firmware-update/xbl_lp5.img" "/dev/block/bootdevice/by-name/xbl_a"
-   package_extract_file "firmware-update/xbl_lp5.img" "/dev/block/bootdevice/by-name/xbl_b"
-   ui_print "Updating xbl_config for DDR5 RAM..."
-   package_extract_file "firmware-update/xbl_config_lp5.img" "/dev/block/bootdevice/by-name/xbl_config_a"
-   package_extract_file "firmware-update/xbl_config_lp5.img" "/dev/block/bootdevice/by-name/xbl_config_b"
+  ui_print "Updating xbl for DDR4 RAM..."
+  package_extract_file "firmware-update/xbl.img" "/dev/block/bootdevice/by-name/xbl_a"
+  package_extract_file "firmware-update/xbl.img" "/dev/block/bootdevice/by-name/xbl_b"
+  ui_print "Updating xbl_config for DDR4 RAM..."
+  package_extract_file "firmware-update/xbl_config.img" "/dev/block/bootdevice/by-name/xbl_config_a"
+  package_extract_file "firmware-update/xbl_config.img" "/dev/block/bootdevice/by-name/xbl_config_b"
+elif [ "$ddr5" = "true" ]; then
+  ui_print "Updating xbl for DDR5 RAM..."
+  package_extract_file "firmware-update/xbl_lp5.img" "/dev/block/bootdevice/by-name/xbl_a"
+  package_extract_file "firmware-update/xbl_lp5.img" "/dev/block/bootdevice/by-name/xbl_b"
+  ui_print "Updating xbl_config for DDR5 RAM..."
+  package_extract_file "firmware-update/xbl_config_lp5.img" "/dev/block/bootdevice/by-name/xbl_config_a"
+  package_extract_file "firmware-update/xbl_config_lp5.img" "/dev/block/bootdevice/by-name/xbl_config_b"
+else
+  # Modern devices: no lp5 variants, default to standard xbl (DDR5)
+  ui_print "Updating xbl..."
+  package_extract_file "firmware-update/xbl.img" "/dev/block/bootdevice/by-name/xbl_a"
+  package_extract_file "firmware-update/xbl.img" "/dev/block/bootdevice/by-name/xbl_b"
+  ui_print "Updating xbl_config..."
+  package_extract_file "firmware-update/xbl_config.img" "/dev/block/bootdevice/by-name/xbl_config_a"
+  package_extract_file "firmware-update/xbl_config.img" "/dev/block/bootdevice/by-name/xbl_config_b"
 fi
 
-#super image
-unzip "$ZIPFILE" META-INF/zstd -d /dev/tmp
-chmod -R 0755 /dev/tmp
+ui_print "Disabing AVB2.0..."
+package_extract_file "firmware-update/vbmeta_system.img" "/dev/block/bootdevice/by-name/vbmeta_system_a"
+package_extract_file "firmware-update/vbmeta_system.img" "/dev/block/bootdevice/by-name/vbmeta_system_b"
+package_extract_file "firmware-update/vbmeta.img" "/dev/block/bootdevice/by-name/vbmeta_a"
+package_extract_file "firmware-update/vbmeta.img" "/dev/block/bootdevice/by-name/vbmeta_b"
 
+
+#boot
+if [[ "$boot_image" == "boot_tv.img" ]]; then
+  ui_print "Flashing custom boot.img..."
+  package_extract_file "$boot_image" "/dev/block/bootdevice/by-name/boot_a"
+	package_extract_file "$boot_image" "/dev/block/bootdevice/by-name/boot_b"
+  ui_print "Flashing custom dtbo.img..."
+	package_extract_file "$dtbo_image" "/dev/block/bootdevice/by-name/dtbo_a"
+	package_extract_file "$dtbo_image" "/dev/block/bootdevice/by-name/dtbo_b"
+else
+  ui_print "Flashing stock boot.img..."
+	package_extract_file "$boot_image" "/dev/block/bootdevice/by-name/boot_a"
+	package_extract_file "$boot_image" "/dev/block/bootdevice/by-name/boot_b"
+  ui_print "Flashing stock dtbo.img..."
+	package_extract_file "$dtbo_image" "/dev/block/bootdevice/by-name/dtbo_a"
+	package_extract_file "$dtbo_image" "/dev/block/bootdevice/by-name/dtbo_b"
+fi
+
+
+
+#super image
 package_extract_zstd "super.zst" "/dev/block/bootdevice/by-name/super"
 
-ui_print "- 清除缓存"
+
+#REMAP_START
+[ -e /dev/block/mapper/odm_a ] && lptools unmap odm_a && lptools map odm_a
+[ -e /dev/block/mapper/mi_ext_a ] && lptools unmap mi_ext_a && lptools map mi_ext_a
+[ -e /dev/block/mapper/system_a ] && lptools unmap system_a && lptools map system_a
+[ -e /dev/block/mapper/vendor_a ] && lptools unmap vendor_a && lptools map vendor_a
+[ -e /dev/block/mapper/product_a ] && lptools unmap product_a && lptools map product_a
+[ -e /dev/block/mapper/odm_dlkm_a ] && lptools unmap odm_dlkm_a && lptools map odm_dlkm_a
+[ -e /dev/block/mapper/system_ext_a ] && lptools unmap system_ext_a && lptools map system_ext_a
+[ -e /dev/block/mapper/vendor_dlkm_a ] && lptools unmap vendor_dlkm_a && lptools map vendor_dlkm_a
+[ -e /dev/block/mapper/system_dlkm_a ] && lptools unmap system_dlkm_a && lptools map system_dlkm_a
+#REMAP_END
+
+#ui_print "- 清除缓存"
 rm -rf /data/dalvik-cache/arm/*
 rm -rf /data/dalvik-cache/arm64/*
 rm -rf /data/system/package_cache/*
 ui_print " "
 ui_print " "
-ui_print "- 刷机完毕"
+#ui_print "- 刷机完毕"
 ui_print " "
 ui_print " "
-ui_print "- 如有红色挂载报错请直接忽略"
-ui_print "- 如有红色挂载报错请直接忽略"
-ui_print "- 如有红色挂载报错请直接忽略"
+#ui_print "- 如有红色挂载报错请直接忽略"
+#ui_print "- 如有红色挂载报错请直接忽略"
+#ui_print "- 如有红色挂载报错请直接忽略"
 ui_print " "
 ui_print " "
 

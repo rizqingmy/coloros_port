@@ -13,62 +13,185 @@
 build_user="Bruce Teng"
 build_host=$(hostname)
 
-# 底包和移植包为外部参数传入
-baserom="$1"
-portrom="$2"
-portrom2="$3"
-portparts="$4"
-work_dir=$(pwd)
-tools_dir=${work_dir}/bin/$(uname)/$(uname -m)
-export PATH=$(pwd)/bin/$(uname)/$(uname -m)/:$(pwd)/otatools/bin/:$PATH
+# Resolve every path relative to this checkout.  The original script used the
+# caller's working directory, so invoking it from another directory silently
+# selected the wrong tools/configuration and could clean unrelated files.
+PORT_CALLER_CWD="$(pwd -P)"
+PORT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+export PORT_PROJECT_ROOT="${PORT_ROOT}"
 
-# Import functions
-source functions.sh
+usage() {
+    printf '%s\n' 'Usage: ./port.sh [--clean] <baserom> <portrom> [portrom2] [portparts]' >&2
+}
+
+FORCE_CLEAN=0
+_port_args=()
+for _port_arg in "$@"; do
+    case "${_port_arg}" in
+        --clean) FORCE_CLEAN=1 ;;
+        -h|--help) usage; exit 0 ;;
+        --*) usage; printf 'Unknown option: %s\n' "${_port_arg}" >&2; exit 2 ;;
+        *) _port_args+=("${_port_arg}") ;;
+    esac
+done
+set -- "${_port_args[@]}"
+if [[ $# -lt 2 || $# -gt 4 ]]; then
+    usage
+    exit 2
+fi
+
+# Normalize local ROM paths before changing directory; URL arguments remain
+# untouched and are downloaded into the repository root below.
+_port_normalized=("$@")
+for _port_idx in 0 1 2; do
+    [[ ${_port_idx} -lt ${#_port_normalized[@]} ]] || break
+    _port_value="${_port_normalized[${_port_idx}]}"
+    case "${_port_value}" in
+        http://*|https://*|/*) ;;
+        *) _port_normalized[${_port_idx}]="${PORT_CALLER_CWD}/${_port_value}" ;;
+    esac
+done
+set -- "${_port_normalized[@]}"
+
+cd "${PORT_ROOT}" || exit 1
+mkdir -p "${PORT_ROOT}/build"
+work_dir="${PORT_ROOT}"
+arch="$(uname -m)"
+[[ "${arch}" == "arm64" ]] && arch="aarch64"
+tools_dir="${PORT_ROOT}/bin/$(uname)/${arch}"
+export PATH="${tools_dir}:${PORT_ROOT}/otatools/bin:${PATH}"
+
+# Import functions from the remote repository's original root location.
+# functions.sh now contains the optimized helpers while retaining the legacy
+# names consumed by this monolithic script.
+source "${PORT_ROOT}/functions.sh" || exit 1
+
+PORT_LOG_FILE="${PORT_ROOT}/build/port.log"
+export PORT_LOG_FILE
+PORT_LOCK_DIR="${PORT_ROOT}/build/.port.lock"
+if ! mkdir "${PORT_LOCK_DIR}" 2>/dev/null; then
+    error "已有另一个移植任务正在运行" "another port task is already running"
+    exit 1
+fi
+printf '%s\n' "$$" > "${PORT_LOCK_DIR}/pid"
+_port_cleanup() {
+    local rc=$?
+    rm -rf -- "${PORT_LOCK_DIR}"
+    exit "${rc}"
+}
+trap _port_cleanup EXIT
+trap 'error "脚本被中断，停止以避免继续修改产物" "Script interrupted; stopping safely"; exit 130' INT TERM
 
 check unzip aria2c 7z zip java python3 zstd bc xmlstarlet
 
-# 可在 bin/port_config 中更改
-port_partition=$(grep "partition_to_port" bin/port_config |cut -d '=' -f 2)
-super_list=$(grep "possible_super_list" bin/port_config |cut -d '=' -f 2)
-repackext4=$(grep "repack_with_ext4" bin/port_config |cut -d '=' -f 2)
-super_extended=$(grep "super_extended" bin/port_config |cut -d '=' -f 2)
-pack_with_dsu=$(grep "pack_with_dsu" bin/port_config | cut -d '=' -f 2)
-pack_method=$(grep "pack_method" bin/port_config | cut -d '=' -f 2)
-ddr_type=$(grep "ddr_type" bin/port_config | cut -d '=' -f 2)
-reusabe_partition_list=$(grep "reusabe_partition_list" bin/port_config | cut -d '=' -f 2)
-if [[ ${repackext4} == true ]]; then
+# Parse only active key=value lines; do not source port_config as shell code.
+port_config_get() {
+    local key="$1"
+    local default_value="${2:-}"
+    local value
+    value="$(awk -F= -v key="${key}" '
+        /^[[:space:]]*#/ || index($0, "=") == 0 { next }
+        {
+            lhs=$1; sub(/^[[:space:]]+/, "", lhs); sub(/[[:space:]]+$/, "", lhs)
+            if (lhs == key) { value=substr($0, index($0, "=")+1); sub(/^[[:space:]]+/, "", value); sub(/[[:space:]]+$/, "", value); print value; exit }
+        }
+    ' "${PORT_ROOT}/bin/port_config" 2>/dev/null)"
+    [[ -n "${value}" ]] && printf '%s\n' "${value}" || printf '%s\n' "${default_value}"
+}
+
+# Values are intentionally explicit and safe by default.  In particular,
+# KernelSU must never be enabled merely because a checked-in config line was
+# copied from an older development tree.
+port_partition="$(port_config_get partition_to_port 'system,system_ext,product,my_product,my_engineering,my_stock,my_heytap,my_carrier,my_region,my_bigball,my_manifest,my_company,my_preload')"
+super_list="$(port_config_get possible_super_list 'system system_ext vendor product my_product odm my_engineering vendor_dlkm system_dlkm my_stock my_heytap my_carrier my_region my_bigball my_manifest my_company my_preload')"
+repackext4="$(port_config_get repack_with_ext4 false)"
+super_extended="$(port_config_get super_extended false)"
+pack_with_dsu="$(port_config_get pack_with_dsu false)"
+pack_method="$(port_config_get pack_method stock)"
+ddr_type="$(port_config_get ddr_type '')"
+reusabe_partition_list="$(port_config_get reusabe_partition_list '')"
+remove_data_encryption="$(port_config_get remove_data_encryption false)"
+enable_ksu="$(port_config_get enable_ksu false)"
+ksu_repo_owner="$(port_config_get ksu_repo_owner tiann)"
+ksu_repo_name="$(port_config_get ksu_repo_name KernelSU)"
+if [[ "${repackext4}" == true ]]; then
     pack_type=EXT
-else
+elif [[ "${repackext4}" == false ]]; then
     pack_type=EROFS
+else
+    error "repack_with_ext4 必须为 true 或 false" "repack_with_ext4 must be true or false"
+    exit 2
+fi
+if [[ "${enable_ksu}" != true && "${enable_ksu}" != false ]]; then
+    error "enable_ksu 必须为 true 或 false" "enable_ksu must be true or false"
+    exit 2
 fi
 
-# 检查为本地包还是链接
-if [ ! -f "${baserom}" ] && [ "$(echo $baserom |grep http)" != "" ];then
-    blue "底包为一个链接，正在尝试下载" "Download link detected, start downloding.."
-    aria2c --max-download-limit=1024M --file-allocation=none -s10 -x10 -j10 ${baserom}
-    baserom=$(basename ${baserom} | sed 's/\?t.*//')
-    if [ ! -f "${baserom}" ];then
-        error "下载错误" "Download error!"
+# 底包和移植包为外部参数传入
+baserom="${1:-}"
+portrom="${2:-}"
+portrom2="${3:-}"
+portparts="${4:-}"
+
+port_resolve_input() {
+    local label="$1"
+    local value="$2"
+    local downloaded_name
+    local downloaded_path
+    if [[ "${value}" == http://* || "${value}" == https://* ]]; then
+        blue "${label}为一个链接，正在尝试下载" "${label} URL detected, downloading"
+        downloaded_name="$(basename "${value%%\?*}")"
+        [[ -n "${downloaded_name}" && "${downloaded_name}" != "." && "${downloaded_name}" != "/" && "${downloaded_name}" != ".." ]] || {
+            error "${label}链接没有有效文件名" "${label} URL has no valid file name"
+            return 1
+        }
+        downloaded_path="${PORT_ROOT}/${downloaded_name}"
+        if [[ ! -s "${downloaded_path}" ]]; then
+            aria2c --max-download-limit=1024M --file-allocation=none -s10 -x10 -j10 \
+                --dir="${PORT_ROOT}" --out="${downloaded_name}" "${value}" || {
+                error "下载错误" "Download error"
+                return 1
+            }
+        fi
+        [[ -s "${downloaded_path}" ]] || {
+            error "下载错误" "Download error"
+            return 1
+        }
+        PORT_RESOLVED_INPUT="${downloaded_path}"
+    elif [[ -f "${value}" ]]; then
+        PORT_RESOLVED_INPUT="${value}"
+    else
+        error "${label}参数错误" "${label}: Invalid parameter"
+        return 1
     fi
-elif [ -f "${baserom}" ];then
-    green "底包: ${baserom}" "BASEROM: ${baserom}"
-else
-    error "底包参数错误" "BASEROM: Invalid parameter"
-    exit
+    green "${label}: ${PORT_RESOLVED_INPUT}" "${label}: ${PORT_RESOLVED_INPUT}"
+}
+
+port_resolve_input "底包" "${baserom}" || exit 1
+baserom="${PORT_RESOLVED_INPUT}"
+port_resolve_input "移植包" "${portrom}" || exit 1
+portrom="${PORT_RESOLVED_INPUT}"
+if [[ -n "${portrom2}" ]]; then
+    port_resolve_input "第二移植包" "${portrom2}" || exit 1
+    portrom2="${PORT_RESOLVED_INPUT}"
 fi
 
-if [ ! -f "${portrom}" ] && [ "$(echo ${portrom} |grep http)" != "" ];then
-    blue "移植包为一个链接，正在尝试下载"  "Download link detected, start downloding.."
-    aria2c --max-download-limit=1024M --file-allocation=none -s10 -x10 -j10 ${portrom}
-    portrom=$(basename ${portrom} | sed 's/\?t.*//')
-    if [ ! -f "${portrom}" ];then
-        error "下载错误" "Download error!"
-    fi
-elif [ -f "${portrom}" ];then
-    green "移植包: ${portrom}" "PORTROM: ${portrom}"
-else
-    error "移植包参数错误" "PORTROM: Invalid parameter"
-    exit
+# Fingerprints are used for safe extraction-cache reuse and are deliberately
+# computed after any URL download has completed.
+baserom_hash="$(port_rom_fingerprint "${baserom}")" || {
+    error "无法计算底包 SHA-256" "Unable to fingerprint BASEROM"
+    exit 1
+}
+portrom_hash="$(port_rom_fingerprint "${portrom}")" || {
+    error "无法计算移植包 SHA-256" "Unable to fingerprint PORTROM"
+    exit 1
+}
+portrom2_hash=""
+if [[ -n "${portrom2}" ]]; then
+    portrom2_hash="$(port_rom_fingerprint "${portrom2}")" || {
+        error "无法计算第二移植包 SHA-256" "Unable to fingerprint second PORTROM"
+        exit 1
+    }
 fi
 
 if [ "$(echo $baserom |grep ColorOS_)" != "" ];then
@@ -110,25 +233,37 @@ else
     exit 1
 fi
 
+sanitize_build_label() {
+    local value="${1:-}"
+    value="${value//[^A-Za-z0-9._-]/_}"
+    value="${value:0:128}"
+    case "${value}" in
+        ""|"."|"..") value="rom" ;;
+    esac
+    printf '%s' "${value}"
+}
+
 # 提取版本信息（仅当有 metadata 时）
 if unzip -l "${portrom}" | grep -q "META-INF/com/android/metadata"; then
     version_name=$(unzip -p "${portrom}" META-INF/com/android/metadata 2>/dev/null | grep "version_name=" | cut -d= -f2)
     ota_version=$(unzip -p "${portrom}" META-INF/com/android/metadata 2>/dev/null | grep "ota_version=" | cut -d= -f2)
 else
-    version_name="$(basename ${portrom%.*})"
+    version_name="$(basename "${portrom%.*}")"
     ota_version="V16.0.0"
 fi
+version_name="$(sanitize_build_label "${version_name}")"
 
 green "ROM初步检测通过，类型: ${portrom_type}" "ROM validation passed. Type: ${portrom_type}"
 [[ -n "${version_name}" ]] && echo "版本名: ${version_name}"
 
 
-if [[ -n $portrom2 ]];then
+mix_port=false
+if [[ -n "${portrom2}" ]]; then
     mix_port=true
 fi
 
-if [[ -n $portparts ]];then
-    mix_port_part=($portparts)
+if [[ -n "${portparts}" ]]; then
+    read -r -a mix_port_part <<< "${portparts}"
 else
     mix_port_part=("my_stock" "my_region" "my_manifest" "my_product")
 fi
@@ -136,10 +271,11 @@ fi
 if [[ $mix_port == true ]];then
     blue "混合移植包模式"
     blue "开始检测第二个移植包" "Validating PORTROM.."
-    if unzip -l ${portrom2} | grep  -q "payload.bin"; then
+    if unzip -l "${portrom2}" | grep -q "payload.bin"; then
         green "第二个ROM初步检测通过" "ROM validation passed."
         portrom2_type="payload"
-	version_name2=$(unzip -p ${portrom2} META-INF/com/android/metadata | grep "version_name=" | cut -d = -f2)
+        version_name2=$(unzip -p "${portrom2}" META-INF/com/android/metadata 2>/dev/null | grep "version_name=" | cut -d = -f2)
+        [[ -n "${version_name2}" ]] || version_name2="$(basename "${portrom2%.*}")"
     elif unzip -l "${portrom2}" | grep -Eq "\.img$"; then
         portrom2_type="img"
         version_name2="$(basename "${portrom2%.*}")"
@@ -148,11 +284,19 @@ if [[ $mix_port == true ]];then
           "payload.bin or *.img not found, please use an official ROM package containing system.img as PORTROM."
         exit 1
     fi
+    version_name2="$(sanitize_build_label "${version_name2}")"
 fi
 green "ROM初步检测通过" "ROM validation passed."
 
 blue "正在清理文件" "Cleaning up.."
 
+if [[ "${FORCE_CLEAN}" -eq 1 ]]; then
+    # --clean is deliberately scoped to the project cache; never broaden it
+    # to the caller's working directory or to downloaded input archives.
+    if [[ -d "${PORT_ROOT}/build/cache/roms" ]]; then
+        find "${PORT_ROOT}/build/cache/roms" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+    fi
+fi
 rm -rf app
 rm -rf tmp
 rm -rf config
@@ -167,16 +311,37 @@ mkdir -p build/portrom/images/
 
 mkdir tmp 
 export TMPDIR=$work_dir/tmp/
+# Content-addressed base-image cache.  BR packages also carry firmware and
+# other non-image entries, so only payload/img inputs use the image-only cache;
+# BR extraction keeps its complete legacy path below.
+baserom_cache_path=""
+baserom_cache_hit=false
+if [[ "${baserom_type}" != "br" ]]; then
+    baserom_cache_path="$(port_cache_dir baserom "${baserom_hash}")"
+    if port_cache_has_images "${baserom_cache_path}" "system,product,system_ext,my_product,my_manifest"; then
+        baserom_cache_hit=true
+        mkdir -p build/baserom/images/
+        cp -f -- "${baserom_cache_path}"/*.img build/baserom/images/ || exit 1
+        green "底包缓存命中，跳过重复解包" "BASEROM cache hit; skipping extraction"
+    fi
+fi
 # ===== 提取底包 =====
-if [[ ${baserom_type} == 'payload' ]]; then
+if [[ "${baserom_cache_hit}" == true ]]; then
+    :
+elif [[ ${baserom_type} == 'payload' ]]; then
     blue "正在提取底包 [payload.bin]" "Extracting files from BASEROM [payload.bin]"   
-    payload-extract extract -o build/baserom/images/ "${baserom}"
+    payload-extract extract -o build/baserom/images/ "${baserom}" || {
+        error "底包 payload 提取失败" "Failed to extract BASEROM payload"
+        exit 1
+    }
     green "底包 [payload.bin] 提取完毕" "[payload.bin] extracted."
 
 elif [[ ${baserom_type} == 'br' ]]; then
     blue "正在提取底包 [new.dat.br]" "Extracting files from BASEROM [*.new.dat.br]"
-    unzip -q "${baserom}" -d build/baserom || \
+    unzip -qo "${baserom}" -d build/baserom || {
         error "解压底包 [new.dat.br]时出错" "Extracting [new.dat.br] error"
+        exit 1
+    }
     green "底包 [new.dat.br] 解压完毕" "[new.dat.br] extracted."
 
     blue "开始分解底包 [new.dat.br]" "Unpacking BASEROM [new.dat.br]"
@@ -195,11 +360,17 @@ elif [[ ${baserom_type} == 'br' ]]; then
     # 转换为 .img
     for i in ${super_list}; do 
         if [[ -f build/baserom/${i}.new.dat.br ]]; then
-            ${tools_dir}/brotli -d build/baserom/${i}.new.dat.br >/dev/null 2>&1
-            python3 ${tools_dir}/sdat2img.py \
+            "${tools_dir}/brotli" -d "build/baserom/${i}.new.dat.br" >/dev/null 2>&1 || {
+                error "${i}.new.dat.br 解压失败" "Failed to decompress ${i}.new.dat.br"
+                exit 1
+            }
+            python3 "${tools_dir}/sdat2img.py" \
                 build/baserom/${i}.transfer.list \
                 build/baserom/${i}.new.dat \
-                build/baserom/images/${i}.img >/dev/null 2>&1
+                build/baserom/images/${i}.img >/dev/null 2>&1 || {
+                error "${i} 分区转换失败" "Failed to convert ${i} to an image"
+                exit 1
+            }
             rm -rf build/baserom/${i}.new.dat* build/baserom/${i}.transfer.list build/baserom/${i}.patch.*
         fi
     done
@@ -208,8 +379,10 @@ elif [[ ${baserom_type} == 'br' ]]; then
 elif [[ ${baserom_type} == 'img' ]]; then
     blue "检测到底包类型为 [img]" "Extracting BASEROM containing .img files"
     mkdir -p build/baserom/images/
-    unzip -q "${baserom}" -d build/baserom/tmp/ || \
+    unzip -qo "${baserom}" -d build/baserom/tmp/ || {
         error "解压底包时出错" "Extracting BASEROM error"
+        exit 1
+    }
     # 移动所有 img 文件
     find build/baserom/tmp/ -type f -name "*.img" -exec mv -fv {} build/baserom/images/ \;
     rm -rf build/baserom/tmp/
@@ -219,93 +392,203 @@ else
     exit 1
 fi
 
+if [[ "${baserom_cache_hit}" != true && "${baserom_type}" != "br" ]]; then
+    port_cache_store_images "${baserom_cache_path}" "build/baserom/images" \
+        "${baserom_hash}" baserom "${device_code}" || \
+        yellow "无法写入底包缓存，继续使用当前解包结果" "Unable to write base cache; continuing"
+fi
+
 
 # ===== 提取移植包 =====
-if [[ -n ${version_name} ]] && [[ -d build/${version_name} ]]; then 
-    blue "检测到已存在解压的移植包cache文件夹 ${version_name}，从中复制" \
-         "Cached ${version_name} folder detected, copying..."
-    IFS=',' read -ra PARTS <<< "$port_partition"
-    for i in "${PARTS[@]}"; do
-        cp -rfv "build/${version_name}/${i}.img" build/portrom/images/
-    done
+# A cache entry is keyed by the archive digest and may be a full or partial
+# hit.  Partial hits copy the known images first and extract only the missing
+# partitions, which keeps large payload extraction resumable.
+port_cache_path="$(port_cache_dir portrom "${portrom_hash}")"
+portrom_cache_dir="${port_cache_path}/"
+port_version_cache_valid=false
+port_cache_hit=""
+port_cache_source=""
+if [[ -n "${version_name}" && -d "build/${version_name}" && \
+      -f "build/${version_name}/.source.sha256" && \
+      "$(< "build/${version_name}/.source.sha256")" == "${portrom_hash}" ]]; then
+    if port_cache_has_images "build/${version_name}" "${port_partition}"; then
+        port_version_cache_valid=true
+        port_cache_hit=full
+        port_cache_source="build/${version_name}"
+    else
+        yellow "移植包缓存缺少所需分区，重新提取" "Port cache is incomplete; extracting again"
+        rm -rf -- "build/${version_name}"
+    fi
+elif [[ -n "${version_name}" && -d "build/${version_name}" ]]; then
+    yellow "移植包缓存来源已变化，重新提取" "Port cache source digest changed; extracting again"
+    rm -rf -- "build/${version_name}"
+fi
+if [[ "${port_version_cache_valid}" != true ]] && port_cache_has_images "${port_cache_path}" "${port_partition}"; then
+    port_cache_hit=full
+    port_cache_source="${port_cache_path}"
+fi
 
+if [[ "${port_cache_hit}" == full ]]; then
+    blue "检测到按 SHA-256 验证的移植包缓存，跳过重复解包" "SHA-256 verified port cache hit; skipping extraction"
+    mkdir -p "build/${version_name}" build/portrom/images/
+    if [[ "${port_cache_source}" != "build/${version_name}" ]]; then
+        cp -f -- "${port_cache_source}"/*.img "build/${version_name}/" 2>/dev/null || true
+    fi
+    cp -f -- "${port_cache_source}"/*.img build/portrom/images/
+    printf '%s\n' "${portrom_hash}" > "build/${version_name}/.source.sha256"
 else
-    mkdir -p build/${version_name}/ build/portrom/images/
+    mkdir -p "build/${version_name}" build/portrom/images/
+    extract_parts="${port_partition}"
+    if [[ -d "${port_cache_path}" ]]; then
+        IFS=',' read -r -a _requested_parts <<< "${port_partition}"
+        extract_parts=""
+        for _requested_part in "${_requested_parts[@]}"; do
+            [[ -n "${_requested_part}" ]] || continue
+            if [[ -s "${port_cache_path}/${_requested_part}.img" ]]; then
+                cp -f -- "${port_cache_path}/${_requested_part}.img" "build/${version_name}/${_requested_part}.img" || exit 1
+                cp -f -- "${port_cache_path}/${_requested_part}.img" build/portrom/images/ || exit 1
+            else
+                extract_parts+="${_requested_part},"
+            fi
+        done
+        extract_parts="${extract_parts%,}"
+        [[ -n "${extract_parts}" ]] && blue "移植包缓存部分命中，提取缺失分区 [${extract_parts}]" "PORTROM partial cache hit; extracting [${extract_parts}]"
+    fi
 
     if [[ ${portrom_type} == 'payload' ]]; then
-        blue "正在提取移植包 [payload.bin]" "Extracting PORTROM [payload.bin]"
-        payload-extract extract -p "${port_partition}" -o "build/${version_name}/" "${portrom}"
-        cp -rfv build/${version_name}/*.img build/portrom/images/
+        if [[ -n "${extract_parts}" ]]; then
+            # payload-extract rejects names that are not present.  Filter a
+            # partial request against the payload manifest first so optional
+            # empty partitions remain available to the later pack stage.
+            _payload_available="$(payload-extract list "${portrom}" 2>/dev/null | tail -n +3 | awk '{print $1}')"
+            _payload_extract_parts=""
+            IFS=',' read -r -a _payload_requested <<< "${extract_parts}"
+            for _payload_part in "${_payload_requested[@]}"; do
+                printf '%s\n' "${_payload_available}" | grep -qx "${_payload_part}" && _payload_extract_parts+="${_payload_part},"
+            done
+            _payload_extract_parts="${_payload_extract_parts%,}"
+            if [[ -n "${_payload_extract_parts}" ]]; then
+                blue "正在提取移植包 [payload.bin]" "Extracting PORTROM [payload.bin]"
+                payload-extract extract -p "${_payload_extract_parts}" -o "build/${version_name}/" "${portrom}" || exit 1
+                cp -f -- "build/${version_name}"/*.img build/portrom/images/ 2>/dev/null || true
+            else
+                blue "缺失分区均不存在于 payload，跳过解包" "Missing partitions are not in payload; skipping extraction"
+            fi
+        fi
         green "移植包 [payload.bin] 提取完毕" "[payload.bin] extracted."
-
     elif [[ ${portrom_type} == 'img' ]]; then
-        blue "检测到移植包类型为 [img]" "Extracting PORTROM containing .img files"
-        # 将逗号分隔的分区名转为数组
-        IFS=',' read -ra PARTS <<< "$port_partition"
-
-        # 构建解压参数
-        declare -a unzip_targets=()
-        for part in "${PARTS[@]}"; do
-          unzip_targets+=("${part}.img" "${part}_a.img" "${part}_b.img")
-        done
-
-        blue "正在选择性解压移植包中的img文件" "Extracting specific img files from PORTROM"
-
-        # 仅解压指定分区的img文件
-        unzip -q "${portrom}" "${unzip_targets[@]}" -d "build/${version_name}/" || \
-        error "解压指定 img 文件失败，请检查包中是否包含 ${port_partition}" \
-          "Failed to extract specified img files from PORTROM."
-
-         green "指定分区镜像解压完成" "Selected partitions extracted successfully."
-        find "build/${version_name}/" -type f -name "*.img" -exec cp -fv {} build/portrom/images/ \;
-        green "移植包 [*.img] 提取完毕" "[*.img] extracted."
-
+        if [[ -n "${extract_parts}" ]]; then
+            blue "检测到移植包类型为 [img]" "Extracting PORTROM containing .img files"
+            IFS=',' read -r -a _requested_parts <<< "${extract_parts}"
+            declare -a unzip_targets=()
+            while IFS= read -r _zip_entry; do
+                _zip_base="${_zip_entry##*/}"
+                for _requested_part in "${_requested_parts[@]}"; do
+                    [[ "${_zip_base}" == "${_requested_part}.img" ||
+                       "${_zip_base}" == "${_requested_part}_a.img" ||
+                       "${_zip_base}" == "${_requested_part}_b.img" ]] && unzip_targets+=("${_zip_entry}")
+                done
+            done < <(unzip -Z1 "${portrom}" 2>/dev/null)
+            if [[ ${#unzip_targets[@]} -eq 0 ]]; then
+                error "移植包中未找到所需分区镜像" "No requested partition images found in PORTROM"
+                exit 1
+            fi
+            if ! unzip -qo "${portrom}" "${unzip_targets[@]}" -d "build/${version_name}/"; then
+                error "解压指定 img 文件失败，请检查移植包内容" "Failed to extract selected images from PORTROM"
+                exit 1
+            fi
+            find "build/${version_name}/" -type f -name "*.img" -exec cp -f -- {} build/portrom/images/ \;
+            green "移植包 [*.img] 提取完毕" "[*.img] extracted."
+        fi
     else
         error "未知移植包类型: ${portrom_type}" "Unknown port package type: ${portrom_type}"
         exit 1
     fi
+    printf '%s\n' "${portrom_hash}" > "build/${version_name}/.source.sha256"
+    port_cache_store_images "${port_cache_path}" "build/${version_name}" "${portrom_hash}" portrom "${version_name}" || \
+        yellow "无法写入移植包缓存，继续使用当前解包结果" "Unable to write port cache; continuing with extracted files"
 fi
 
-if [[ -n ${version_name2} ]] && [[ -d build/${version_name2} ]];then 
-    blue "检测到已存在解压的第二个移植包cache文件夹${version_name2}，从中复制" "cached ${version_name2} folder detected, copying"
-    #IFS=',' read -ra PARTS <<< "$port_partition"  # 用逗号分割为数组
-    for i in "${mix_port_part[@]}"; do
-        # if [[ -f build/${version_name}/${i}_patched.img ]];then
-        #     skip_list2+=("$i")
-        #     cp -rfv build/${version_name}/${i}_patched.img build/portrom/images/${i}.img
-        #else 
-            cp -rfv build/${version_name2}/${i}.img build/portrom/images/
-        #fi
-    done
-elif [[ -n ${version_name2} ]];then
-    if [[ ${portrom2_type} == 'payload' ]]; then
-        blue "正在提取移植包 [payload.bin]" "Extracting files from PORTROM [payload.bin]"
-        mkdir -p build/${version_name2}/
-        payload-extract extract -p ${port_partition} -o build/${version_name2}/ $portrom2
-        for i in "${mix_port_part[@]}"; do
-            cp -rfv build/${version_name2}/${i}.img build/portrom/images/
+port_version2_cache_valid=false
+port_cache_path2=""
+portrom2_cache_dir=""
+if [[ -n "${version_name2}" ]]; then
+    port_cache_path2="$(port_cache_dir portrom2 "${portrom2_hash}")"
+    portrom2_cache_dir="${port_cache_path2}/"
+    port_cache2_hit=""
+    port_cache2_source=""
+    if [[ -n "${version_name2}" && -d "build/${version_name2}" && \
+          -f "build/${version_name2}/.source.sha256" && \
+          "$(< "build/${version_name2}/.source.sha256")" == "${portrom2_hash}" ]] && \
+       port_cache_has_images "build/${version_name2}" "$(IFS=','; echo "${mix_port_part[*]}")"; then
+        port_cache2_hit=full
+        port_cache2_source="build/${version_name2}"
+    elif [[ -d "${port_cache_path2}" ]] && \
+         port_cache_has_images "${port_cache_path2}" "$(IFS=','; echo "${mix_port_part[*]}")"; then
+        port_cache2_hit=full
+        port_cache2_source="${port_cache_path2}"
+    fi
+
+    if [[ "${port_cache2_hit}" == full ]]; then
+        blue "检测到按 SHA-256 验证的第二移植包缓存，跳过重复解包" "SHA-256 verified second port cache hit"
+        mkdir -p "build/${version_name2}" build/portrom/images/
+        for _mix_part in "${mix_port_part[@]}"; do
+            if [[ "${port_cache2_source}" != "build/${version_name2}" ]]; then
+                cp -f -- "${port_cache2_source}/${_mix_part}.img" "build/${version_name2}/" || exit 1
+            fi
+            cp -f -- "${port_cache2_source}/${_mix_part}.img" build/portrom/images/ || exit 1
         done
-    elif [[ ${portrom2_type} == 'img' ]]; then
-        blue "检测到移植包2类型为 [img]" "Extracting PORTROM containing .img files"
-        # 将逗号分隔的分区名转为数组
-        IFS=',' read -ra PARTS <<< "$port_partition"
-
-        # 构建解压参数
-        declare -a unzip_targets=()
-        for part in "${PARTS[@]}"; do
-          unzip_targets+=("${part}.img" "${part}_a.img" "${part}_b.img")
+        printf '%s\n' "${portrom2_hash}" > "build/${version_name2}/.source.sha256"
+        port_version2_cache_valid=true
+    else
+        mkdir -p "build/${version_name2}" build/portrom/images/
+        extract2_parts=""
+        for _mix_part in "${mix_port_part[@]}"; do
+            [[ -n "${_mix_part}" ]] || continue
+            if [[ -s "${port_cache_path2}/${_mix_part}.img" ]]; then
+                cp -f -- "${port_cache_path2}/${_mix_part}.img" "build/${version_name2}/${_mix_part}.img" || exit 1
+                cp -f -- "${port_cache_path2}/${_mix_part}.img" build/portrom/images/ || exit 1
+            else
+                extract2_parts+="${_mix_part},"
+            fi
         done
-
-        blue "正在选择性解压移植包中的img文件" "Extracting specific img files from PORTROM"
-
-        # 仅解压指定分区的img文件
-        unzip -q "${portrom2}" "${unzip_targets[@]}" -d "build/${version_name2}/" || \
-        error "解压指定 img 文件失败，请检查包中是否包含 ${port_partition}" \
-          "Failed to extract specified img files from PORTROM."
-
-         green "指定分区镜像解压完成" "Selected partitions extracted successfully."
-        find "build/${version_name2}/" -type f -name "*.img" -exec cp -fv {} build/portrom/images/ \;
-        green "移植包 [*.img] 提取完毕" "[*.img] extracted."
+        extract2_parts="${extract2_parts%,}"
+        if [[ ${portrom2_type} == 'payload' ]]; then
+            if [[ -n "${extract2_parts}" ]]; then
+                _payload2_available="$(payload-extract list "${portrom2}" 2>/dev/null | tail -n +3 | awk '{print $1}')"
+                _payload2_extract_parts=""
+                IFS=',' read -r -a _payload2_requested <<< "${extract2_parts}"
+                for _payload2_part in "${_payload2_requested[@]}"; do
+                    printf '%s\n' "${_payload2_available}" | grep -qx "${_payload2_part}" && _payload2_extract_parts+="${_payload2_part},"
+                done
+                _payload2_extract_parts="${_payload2_extract_parts%,}"
+                if [[ -n "${_payload2_extract_parts}" ]]; then
+                    payload-extract extract -p "${_payload2_extract_parts}" -o "build/${version_name2}/" "${portrom2}" || exit 1
+                    for _mix_part in "${mix_port_part[@]}"; do
+                        [[ -s "build/${version_name2}/${_mix_part}.img" ]] || continue
+                        cp -f -- "build/${version_name2}/${_mix_part}.img" build/portrom/images/ || exit 1
+                    done
+                fi
+            fi
+        elif [[ ${portrom2_type} == 'img' && -n "${extract2_parts}" ]]; then
+            IFS=',' read -r -a _mix_requested <<< "${extract2_parts}"
+            declare -a unzip_targets2=()
+            while IFS= read -r _zip_entry; do
+                _zip_base="${_zip_entry##*/}"
+                for _mix_part in "${_mix_requested[@]}"; do
+                    [[ "${_zip_base}" == "${_mix_part}.img" ||
+                       "${_zip_base}" == "${_mix_part}_a.img" ||
+                       "${_zip_base}" == "${_mix_part}_b.img" ]] && unzip_targets2+=("${_zip_entry}")
+                done
+            done < <(unzip -Z1 "${portrom2}" 2>/dev/null)
+            if [[ ${#unzip_targets2[@]} -gt 0 ]]; then
+                unzip -qo "${portrom2}" "${unzip_targets2[@]}" -d "build/${version_name2}/" || exit 1
+                find "build/${version_name2}/" -type f -name "*.img" -exec cp -f -- {} build/portrom/images/ \;
+            fi
+        fi
+        printf '%s\n' "${portrom2_hash}" > "build/${version_name2}/.source.sha256"
+        port_cache_store_images "${port_cache_path2}" "build/${version_name2}" "${portrom2_hash}" portrom2 "${version_name2}" || \
+            yellow "无法写入第二移植包缓存，继续使用当前解包结果" "Unable to write second port cache; continuing"
     fi
 fi
 
@@ -315,17 +598,40 @@ elif [[ -n ${version_name} ]];then
     app_patch_folder=${version_name}
 fi
 
-for part in system product system_ext my_product my_manifest;do
-    extract_partition build/baserom/images/${part}.img build/baserom/images    
+for part in system product system_ext my_product my_manifest; do
+    if [[ -d "build/baserom/images/${part}" ]]; then
+        if [[ -f "build/baserom/images/${part}/.unpacked.done" ]]; then
+            yellow "跳过已完成的底包分区 [${part}]" "Skipping completed BASEROM partition [${part}]"
+            continue
+        fi
+        yellow "发现上次未完成的底包分区 [${part}]，正在清理" "Removing incomplete BASEROM partition [${part}]"
+        rm -rf -- "build/baserom/images/${part}"
+    fi
+    if [[ ! -s "build/baserom/images/${part}.img" ]]; then
+        error "底包缺少必需分区 ${part}.img" "BASEROM is missing required ${part}.img"
+        exit 1
+    fi
+    extract_partition "build/baserom/images/${part}.img" build/baserom/images || exit 1
+    if [[ -d "build/baserom/images/${part}" ]]; then
+        : > "build/baserom/images/${part}/.unpacked.done"
+    fi
 done
 
 # Move those to portrom folder. We need to pack those imgs into final port rom
-for image in vendor odm my_company my_preload system_dlkm vendor_dlkm my_engineering;do
-    if [ -f build/baserom/images/${image}.img ];then
-        mv -f build/baserom/images/${image}.img build/portrom/images/${image}.img
+for image in vendor odm my_company my_preload system_dlkm vendor_dlkm my_engineering; do
+    if [[ -f "build/baserom/images/${image}.img" ]]; then
+        mv -f "build/baserom/images/${image}.img" "build/portrom/images/${image}.img" || exit 1
 
         # Extracting vendor at first, we need to determine which super parts to pack from Baserom fstab. 
-        extract_partition build/portrom/images/${image}.img build/portrom/images/
+        if [[ -d "build/portrom/images/${image}" && -f "build/portrom/images/${image}/.unpacked.done" ]]; then
+            yellow "跳过已完成的底包分区 [${image}]" "Skipping completed BASEROM partition [${image}]"
+        else
+            [[ -d "build/portrom/images/${image}" ]] && rm -rf -- "build/portrom/images/${image}"
+            extract_partition "build/portrom/images/${image}.img" build/portrom/images/ || exit 1
+            if [[ -d "build/portrom/images/${image}" ]]; then
+                : > "build/portrom/images/${image}/.unpacked.done"
+            fi
+        fi
 
     fi
 done
@@ -339,28 +645,81 @@ fi
 
 # 分解镜像
 green "开始提取逻辑分区镜像" "Starting extract portrom partition from img"
-for part in ${super_list};do
+_port_extract_failed=0
+_port_extract_pids=()
+for part in ${super_list}; do
     # 检查是否在 skip_list1 或 skip_list2 中
 #    if [[ " ${skip_list1[@]} " =~ " ${part} " ]] || [[ " ${skip_list2[@]} " =~ " ${part} " ]]; then
  #       yellow "跳过分区 [${part}]，已通过patched镜像复用" "Skip [${part}], already reused from patched image"
   #      continue
    # fi
     # Skip already extraced parts from BASEROM
-    if [[ ! -d build/portrom/images/${part} ]]; then
+    if [[ -d "build/portrom/images/${part}" && ! -f "build/portrom/images/${part}/.unpacked.done" ]]; then
+        yellow "发现上次未完成的分区目录 [${part}]，正在清理" "Removing incomplete partition directory [${part}]"
+        rm -rf -- "build/portrom/images/${part}"
+    fi
+    if [[ ! -d "build/portrom/images/${part}" || ! -f "build/portrom/images/${part}/.unpacked.done" ]]; then
+        if [[ ! -s "build/portrom/images/${part}.img" ]]; then
+            if [[ "${part}" == my_preload || "${part}" == my_company ]]; then
+                blue "移植包未提供可选分区 [${part}]，留给打包阶段处理" "Optional partition [${part}] absent; packing stage will handle it"
+                continue
+            fi
+            error "移植包缺少必需分区镜像 [${part}.img]" "PORTROM is missing required partition image [${part}.img]"
+            _port_extract_failed=1
+            continue
+        fi
         blue "提取 [${part}] 分区..." "Extracting [${part}]"
 
         (
         extract_partition "${work_dir}/build/portrom/images/${part}.img" "${work_dir}/build/portrom/images/" && \
-        rm -rf "${work_dir}/build/baserom/images/${part}.img"
+        : > "${work_dir}/build/portrom/images/${part}/.unpacked.done" && \
+        rm -f -- "${work_dir}/build/baserom/images/${part}.img"
         ) &
+        _port_extract_pids+=("$!")
     else
         yellow "跳过从PORTORM提取分区[${part}]" "Skip extracting [${part}] from PORTROM"
     fi
 done
-wait
+for _port_extract_pid in "${_port_extract_pids[@]}"; do
+    wait "${_port_extract_pid}" || _port_extract_failed=1
+done
+if [[ "${_port_extract_failed}" -ne 0 ]]; then
+    error "逻辑分区提取失败" "Partition extraction failed"
+    exit 1
+fi
 rm -rf config
 
 blue "正在获取ROM参数" "Fetching ROM build prop."
+
+# Detect tablet mode before changing the port properties.  A base/port
+# mismatch is recorded for diagnostics so device-specific overlays can choose
+# not to cross tablet and phone resource sets accidentally.
+stock_build_characteristics=""
+if [[ -f build/baserom/images/my_product/build.prop ]]; then
+    stock_build_characteristics=$(grep -m1 '^ro\.build\.characteristics=' \
+        build/baserom/images/my_product/build.prop | cut -d= -f2)
+fi
+if [[ -z "${stock_build_characteristics}" && -f build/baserom/images/product/build.prop ]]; then
+    stock_build_characteristics=$(grep -m1 '^ro\.build\.characteristics=' \
+        build/baserom/images/product/build.prop | cut -d= -f2)
+fi
+port_build_characteristics=""
+if [[ -f build/portrom/images/my_product/build.prop ]]; then
+    port_build_characteristics=$(grep -m1 '^ro\.build\.characteristics=' \
+        build/portrom/images/my_product/build.prop | cut -d= -f2)
+fi
+if [[ -z "${port_build_characteristics}" && -f build/portrom/images/product/build.prop ]]; then
+    port_build_characteristics=$(grep -m1 '^ro\.build\.characteristics=' \
+        build/portrom/images/product/build.prop | cut -d= -f2)
+fi
+stock_is_tablet=false
+port_is_tablet=false
+[[ "${stock_build_characteristics}" == tablet ]] && stock_is_tablet=true
+[[ "${port_build_characteristics}" == tablet ]] && port_is_tablet=true
+tablet_mode_cross=false
+[[ "${stock_is_tablet}" != "${port_is_tablet}" ]] && tablet_mode_cross=true
+green "平板属性 - 底包: [${stock_is_tablet}] 移植包: [${port_is_tablet}] 跨模式: [${tablet_mode_cross}]" \
+      "Tablet - Stock: [${stock_is_tablet}] Port: [${port_is_tablet}] Cross: [${tablet_mode_cross}]"
 
 # 安卓版本
 base_android_version=$(< build/baserom/images/system/system/build.prop grep "ro.build.version.release" |awk 'NR==1' |cut -d '=' -f 2)
@@ -473,6 +832,20 @@ portIsRealmeUI=false
 
 port_oplusrom_version=$(get_oplusrom_version)
 
+# ColorOS 16.0.7+ mediaserver expects liboplusbindermonitor.so.  Some older
+# base/vendor images still carry the library while the newer port image does
+# not, so copy every matching base path into the corresponding port path.
+if ver_gte "${port_oplusrom_version}" "16.0.7"; then
+    blue "修复ColorOS 16.0.6+ mediaserver库依赖问题" "Fixing mediaserver library dependency for ColorOS 16.0.6+"
+    while IFS= read -r -d '' source_lib; do
+        relative_path="${source_lib#build/baserom/images/}"
+        target_lib="build/portrom/images/${relative_path}"
+        mkdir -p "$(dirname "${target_lib}")" || exit 1
+        cp -f -- "${source_lib}" "${target_lib}" || exit 1
+        green "已从底包复制liboplusbindermonitor.so: ${relative_path}" "Copied liboplusbindermonitor.so: ${relative_path}"
+    done < <(find build/baserom/images/ -type f -name "liboplusbindermonitor.so" -print0 2>/dev/null)
+fi
+
 if [[ "$port_brand" == "realme" ]];then
     portIsRealmeUI=true
 fi
@@ -566,7 +939,15 @@ for prop in $(find build/portrom/images -name "build.prop");do
 done
 
 
-old_face_unlock_app=$(find build/baserom/images/my_product -name "OPFaceUnlock.apk")
+# Optional identity/PIF assets are installed before framework/APK surgery so
+# their init contract, property policy, and shared-library placement are part
+# of the extracted tree that later gets repacked. Missing release assets are a
+# supported no-op; proprietary payloads are never copied into this checkout.
+install_oplus_identity_pif_assets || exit 1
+install_property_compat_policy || exit 1
+ensure_android_ext_shared_library || exit 1
+
+old_face_unlock_app=$(find build/baserom/images/my_product -type f -name "OPFaceUnlock.apk" -print -quit)
 if [[ -f build/${app_patch_folder}/patched/services.jar ]];then
     blue "复制已经处理过的services.jar"
     cp -rfv build/${app_patch_folder}/patched/services.jar build/portrom/images/system/system/framework/services.jar
@@ -691,7 +1072,10 @@ elif [[ -f $targetOplusService ]];then
 
 fi
 
-if [[ ${base_device_family} == "OPSM8250" ]] || [[ ${base_device_family} == "OPSM8350" ]]; then
+if { [[ ${base_device_family} == "OPSM8250" ]] || [[ ${base_device_family} == "OPSM8350" ]]; } \
+   && [[ "${PORT_ENABLE_FACE_UNLOCK_FIX:-false}" == "true" ]]; then
+    # The replacement bundle removes vendor HAL/overlay entries and is kept
+    # opt-in until the exact base/port camera pair has been validated.
     blue "修复ColorOS15/OxygenOS15 人脸识解锁问题" "COS15/OOS15: Fix Face Unlock for SM8250/8350"
     #pushd tmp/services
     #patch -p1 < ${work_dir}/devices/${base_product_device}/0001-face-unlock-fix-for-op8t.patch
@@ -814,55 +1198,97 @@ if [[ ${port_android_version} -ge 15 ]]; then
         fi
     fi
 fi
-echo "ro.surface_flinger.game_default_frame_rate_override=120" >>  build/portrom/images/vendor/default.prop
-#Unlock AI CAll
-#targetAICallAssistant=$(find build/portrom/images/ -name "HeyTapSpeechAssist.apk")
-if [[ -f build/${app_patch_folder}/patched/HeyTapSpeechAssist.apk ]]; then
-    blue "复制已经处理过的HeyTapSpeechAssist.apk"
-    cp -rfv build/${app_patch_folder}/patched/HeyTapSpeechAssist.apk $targetAICallAssistant
-elif [[ -f $targetAICallAssistant ]];then
+
+# Keep the frame-rate override idempotent.  Re-running a partially completed
+# port must not grow build.prop indefinitely.
+grep -qF 'ro.surface_flinger.game_default_frame_rate_override=120' \
+    build/portrom/images/vendor/default.prop 2>/dev/null || \
+    echo 'ro.surface_flinger.game_default_frame_rate_override=120' >> \
+        build/portrom/images/vendor/default.prop
+
+# Unlock AI Call when exactly one assistant APK is present.  The old script
+# left targetAICallAssistant commented out, so the patch silently never ran;
+# ambiguous layouts now fail before touching either APK.
+targetAICallAssistant=""
+_ai_assistants=()
+while IFS= read -r _ai_assistant; do
+    [[ -n "${_ai_assistant}" ]] && _ai_assistants[${#_ai_assistants[@]}]="${_ai_assistant}"
+done < <(find build/portrom/images/ -type f -name 'HeyTapSpeechAssist.apk' 2>/dev/null)
+if [[ ${#_ai_assistants[@]} -gt 1 ]]; then
+    error "找到多个 HeyTapSpeechAssist.apk，无法确定修补目标: ${_ai_assistants[*]}" \
+        "Found multiple HeyTapSpeechAssist.apk files; refusing an ambiguous patch"
+    exit 1
+elif [[ ${#_ai_assistants[@]} -eq 1 ]]; then
+    targetAICallAssistant="${_ai_assistants[0]}"
+fi
+if [[ -n "${targetAICallAssistant}" ]]; then
+    if [[ -f "build/${app_patch_folder}/patched/HeyTapSpeechAssist.apk" ]]; then
+        blue "复制已经处理过的HeyTapSpeechAssist.apk"
+        cp -p -- "build/${app_patch_folder}/patched/HeyTapSpeechAssist.apk" \
+            "${targetAICallAssistant}" || exit 1
+    else
         blue "Unlock AI Call"
-        cp -rf $targetAICallAssistant tmp/$(basename $targetAICallAssistant).bak
-        java -jar bin/apktool/APKEditor.jar d -f -i $targetAICallAssistant -o tmp/HeyTapSpeechAssist $extra_args
-        targetSmali=$(find tmp -type f -name "AiCallCommonBean.smali")
-        python3 bin/patchmethod_v2.py $targetSmali getSupportAiCall -return true 
-        find tmp/HeyTapSpeechAssist -type f -name "*.smali" -exec sed -i "s/sget-object \([vp][0-9]\+\), Landroid\/os\/Build;->MODEL:Ljava\/lang\/String;/const-string \1, \"PLG110\"/g" {} +
-        java -jar bin/apktool/APKEditor.jar b -f -i tmp/HeyTapSpeechAssist -o build/${app_patch_folder}/patched/HeyTapSpeechAssist.apk $extra_args
-        cp -rfv build/${app_patch_folder}/patched/HeyTapSpeechAssist.apk $targetAICallAssistant 
+        cp -p -- "${targetAICallAssistant}" \
+            "tmp/$(basename "${targetAICallAssistant}").bak" || exit 1
+        apk_decode "${targetAICallAssistant}" tmp/HeyTapSpeechAssist \
+            --artifact HeyTapSpeechAssist.apk ${extra_args:-} || exit 1
+        targetSmali=$(find tmp/HeyTapSpeechAssist -type f -name 'AiCallCommonBean.smali' -print -quit)
+        if [[ -n "${targetSmali}" ]]; then
+            python3 bin/patchmethod_v2.py "${targetSmali}" getSupportAiCall -return true || exit 1
+        fi
+        find tmp/HeyTapSpeechAssist -type f -name '*.smali' -exec \
+            sed -i 's/sget-object \([vp][0-9]\+\), Landroid\/os\/Build;->MODEL:Ljava\/lang\/String;/const-string \1, "PLG110"/g' {} +
+        mkdir -p "build/${app_patch_folder}/patched"
+        apk_build tmp/HeyTapSpeechAssist \
+            "build/${app_patch_folder}/patched/HeyTapSpeechAssist.apk" \
+            --artifact HeyTapSpeechAssist.apk ${extra_args:-} || exit 1
+        cp -p -- "build/${app_patch_folder}/patched/HeyTapSpeechAssist.apk" \
+            "${targetAICallAssistant}" || exit 1
+    fi
 fi
 # patch_smali_with_apktool "HeyTapSpeechAssist.apk" "com/heytap/speechassist/aicall/setting/config/AiCallCommonBean.smali" ".method public final getSupportAiCall()Z/,/.end method" ".method public final getSupportAiCall()Z\n\t.locals 1\n\tconst\/4 v0, 0x1\n\treturn v0\n.end method" "regex"
 
 ota_patched=false
-if [[ $regionmark == "CN" ]];then
-    cp -rf devices/common/OTA_CN.apk build/portrom/images/system_ext/app/OTA/OTA.apk && ota_patched=true
-
+if [[ $regionmark == "CN" ]]; then
+    if ver_gte "${port_oplusrom_version}" "16.0.5" && \
+       ensure_resource_available devices/common/OTA_CN_16.1.apk; then
+        cp -p devices/common/OTA_CN_16.1.apk \
+            build/portrom/images/system_ext/app/OTA/OTA.apk && ota_patched=true
+    elif ensure_resource_available devices/common/OTA_CN.apk; then
+        cp -p devices/common/OTA_CN.apk \
+            build/portrom/images/system_ext/app/OTA/OTA.apk && ota_patched=true
+    fi
 else
-    cp -rf devices/common/OTA_IN.apk build/portrom/images/system_ext/app/OTA/OTA.apk && ota_patched=true
+    if ensure_resource_available devices/common/OTA_IN.apk; then
+        cp -p devices/common/OTA_IN.apk \
+            build/portrom/images/system_ext/app/OTA/OTA.apk && ota_patched=true
+    fi
 fi
 
 
 if [[ $ota_patched == "false" ]];then
     # Remove OTA dm-verity
-    targetOTA=$(find build/portrom/images/ -name "OTA.apk")
+    targetOTA=$(find build/portrom/images/ -type f -name "OTA.apk" -print -quit)
     if [[ -f build/${app_patch_folder}/patched/OTA.apk ]]; then
         blue "复制已经处理过的OTA.apk"
-        cp -rfv build/${app_patch_folder}/patched/OTA.apk $targetOTA
+        [[ -n "${targetOTA}" ]] && cp -p -- build/${app_patch_folder}/patched/OTA.apk "${targetOTA}" || exit 1
     
-    elif [[ -f $targetOTA ]];then
+    elif [[ -f "${targetOTA}" ]]; then
         blue "Removing OTA dm-verity"
-        cp -rf $targetOTA tmp/$(basename $targetOTA).bak
-        java -jar bin/apktool/APKEditor.jar d -f -i $targetOTA -o tmp/OTA $extra_args
-        targetSmali=$(find tmp -type f -path "*/com/oplus/common/a.smali")
-        python3 bin/patchmethod_v2.py -d tmp/OTA -k ro.boot.vbmeta.device_state locked -return false 
-        java -jar bin/apktool/APKEditor.jar b -f -i tmp/OTA -o  build/${app_patch_folder}/patched/OTA.apk  $extra_args
-         cp -rfv build/${app_patch_folder}/patched/OTA.apk $targetOTA
+        cp -p -- "${targetOTA}" "tmp/$(basename "${targetOTA}").bak" || exit 1
+        apk_decode "${targetOTA}" tmp/OTA --artifact OTA.apk ${extra_args:-} || exit 1
+        python3 bin/patchmethod_v2.py -d tmp/OTA -k ro.boot.vbmeta.device_state locked -return false || exit 1
+        mkdir -p "build/${app_patch_folder}/patched"
+        apk_build tmp/OTA "build/${app_patch_folder}/patched/OTA.apk" \
+            --artifact OTA.apk ${extra_args:-} || exit 1
+        cp -p -- "build/${app_patch_folder}/patched/OTA.apk" "${targetOTA}" || exit 1
     fi
 fi
 
 
-    EXTEDNED_MODELS=("PJF110" "PEEM00" "PEDM00" "LE2120" "LE2121" "LE2123" "KB2000" "KB2001" "KB2005" "KB2003" "LE2110" "LE2111" "LE2112" "LE2113" "IN2010" "IN2011" "IN2012" "IN2013" "IN2020" "IN2021" "IN2022" "IN2023")
+    EXTENDED_MODELS=("PJF110" "PEEM00" "PEDM00" "LE2120" "LE2121" "LE2123" "KB2000" "KB2001" "KB2005" "KB2003" "LE2110" "LE2111" "LE2112" "LE2113" "IN2010" "IN2011" "IN2012" "IN2013" "IN2020" "IN2021" "IN2022" "IN2023")
 
-    targetAIUnit=$(find build/portrom/images/ -name "AIUnit.apk")
+    targetAIUnit=$(find build/portrom/images/ -type f -name "AIUnit.apk" -print -quit)
     MODEL=PLG110
     #PKZ110 Reno 14 Pro
     #CPH2723 OnePlus 13s
@@ -870,22 +1296,27 @@ fi
     #CPH2749 OnePlus 15
     [[ $regionmark != CN ]] && MODEL=CPH2745
 
-    if [[ -f build/${app_patch_folder}/patched/AIUnit.apk ]]; then
+    if [[ -z "${targetAIUnit}" ]]; then
+        yellow "未找到 AIUnit.apk，跳过高端 AI 功能补丁" "AIUnit.apk not found; skipping AI feature patch"
+    elif [[ -f build/${app_patch_folder}/patched/AIUnit.apk ]]; then
             blue "复制已经处理过的OTA.apk"
-            cp -rfv build/${app_patch_folder}/patched/AIUnit.apk $targetAIUnit
+            cp -p -- build/${app_patch_folder}/patched/AIUnit.apk "${targetAIUnit}" || exit 1
         
-    elif [[ -f $targetAIUnit ]];then
+    elif [[ -f "${targetAIUnit}" ]]; then
         blue "Unlock High-End AI features, Device Model: $MODEL"
-        cp -rf $targetAIUnit tmp/$(basename $targetAIUnit).bak
-        java -jar bin/apktool/APKEditor.jar d -f -i $targetAIUnit -o tmp/AIUnit $extra_args
+        cp -p -- "${targetAIUnit}" "tmp/$(basename "${targetAIUnit}").bak" || exit 1
+        apk_decode "${targetAIUnit}" tmp/AIUnit --artifact AIUnit.apk ${extra_args:-} || exit 1
         find tmp/AIUnit -type f -name "*.smali" -exec sed -i "s/sget-object \([vp][0-9]\+\), Landroid\/os\/Build;->MODEL:Ljava\/lang\/String;/const-string \1, \"$MODEL\"/g" {} +
-        targetSmali=$(find tmp -type f -name "UnitConfig.smali")
-        python3 bin/patchmethod_v2.py $targetSmali isAllWhiteConditionMatch
-        python3 bin/patchmethod_v2.py $targetSmali isWhiteConditionsMatch
-        python3 bin/patchmethod_v2.py $targetSmali isSupport
+        targetSmali=$(find tmp/AIUnit -type f -name "UnitConfig.smali" -print -quit)
+        if [[ -n "${targetSmali}" ]]; then
+            python3 bin/patchmethod_v2.py "${targetSmali}" isAllWhiteConditionMatch || exit 1
+            python3 bin/patchmethod_v2.py "${targetSmali}" isWhiteConditionsMatch || exit 1
+            python3 bin/patchmethod_v2.py "${targetSmali}" isSupport || exit 1
+        fi
 
-        unit_config_list=$(find tmp/AIUnit -type f -name "unit_config_list.json")
-        jq --arg models_str "${EXTEDNED_MODELS[*]}" '
+        unit_config_list=$(find tmp/AIUnit -type f -name "unit_config_list.json" -print -quit)
+        if [[ -n "${unit_config_list}" ]]; then
+        jq --arg models_str "${EXTENDED_MODELS[*]}" '
     # 定义数组变量
     ($models_str | split(" ")) as $new_models
     |
@@ -908,14 +1339,23 @@ fi
 
         if has("minAndroidApi") then .minAndroidApi = 30 else . end
     )
-    ' $unit_config_list > ${unit_config_list}.bak && mv ${unit_config_list}.bak ${unit_config_list}
-        java -jar bin/apktool/APKEditor.jar b -f -i tmp/AIUnit -o build/${app_patch_folder}/patched/AIUnit.apk  $extra_args
-        cp -rfv build/${app_patch_folder}/patched/AIUnit.apk $targetAIUnit 
+    ' "${unit_config_list}" > "${unit_config_list}.bak" && mv -f -- "${unit_config_list}.bak" "${unit_config_list}" || exit 1
+        fi
+        mkdir -p "build/${app_patch_folder}/patched"
+        apk_build tmp/AIUnit "build/${app_patch_folder}/patched/AIUnit.apk" \
+            --artifact AIUnit.apk ${extra_args:-} || exit 1
+        cp -p -- "build/${app_patch_folder}/patched/AIUnit.apk" "${targetAIUnit}" || exit 1
     fi
 
 if [[ $port_android_version == 16 || $port_android_version == 17 ]] && [[ $base_android_version -lt 15 ]] ;then
     # workaround fix AI Eraser
-    cp build/portrom/images/odm/lib64/libaiboost.so build/portrom/images/my_product/lib64/libaiboost.so
+    if [[ -f build/portrom/images/odm/lib64/libaiboost.so ]]; then
+        mkdir -p build/portrom/images/my_product/lib64/
+        cp -p build/portrom/images/odm/lib64/libaiboost.so \
+            build/portrom/images/my_product/lib64/libaiboost.so
+    else
+        yellow "未找到 libaiboost.so，跳过 AI Eraser 兼容补位" "libaiboost.so not found; skipping AI Eraser backfill"
+    fi
     # sed -i 's|^/odm/lib64/libaiboost\.so.*$|/odm/lib64/libaiboost\.so u:object_r:same_process_hal_file:s0|' build/portrom/images/config/odm_file_contexts
     # echo "/(vendor|odm)/lib(64)?/libaiboost\.so  u:object_r:same_process_hal_file:s0" >> build/portrom/images/vendor/etc/selinux/vendor_file_contexts
 fi
@@ -930,65 +1370,80 @@ if ensure_resource_available "devices/common/xeutoolbox.zip" && [[ $base_android
     echo "(allow init toolbox_exec (file ((execute_no_trans))))" >> build/portrom/images/system_ext/etc/selinux/system_ext_sepolicy.cil
     unzip -o devices/common/xeutoolbox.zip -d build/portrom/images/
 elif [[ $base_android_version -lt 15 ]];then
-    targetGallery=$(find build/portrom/images/ -name "OppoGallery2.apk")
+    targetGallery=$(find build/portrom/images/ -type f -name "OppoGallery2.apk" -print -quit)
     if [[ -f build/${app_patch_folder}/patched/OppoGallery2.apk ]]; then
             blue "复制已经处理过的OppoGallery2"
             cp -rfv build/${app_patch_folder}/patched/OppoGallery2.apk $targetGallery
         
-    elif [[ -f $targetGallery ]];then
+    elif [[ -f "${targetGallery}" ]]; then
         blue "Unlock AI Editor"
-        cp -rf $targetGallery tmp/$(basename $targetGallery).bak
-        java -jar bin/apktool/APKEditor.jar d -f -i $targetGallery -o tmp/Gallery $extra_args
-        python3 bin/patchmethod_v2.py -d tmp/Gallery -k "const-string.*\"ro.product.first_api_level\"" -hook "     const/16 reg, 0x22" 
-        java -jar bin/apktool/APKEditor.jar b -f -i tmp/Gallery -o build/${app_patch_folder}/patched/OppoGallery2.apk $extra_args
-        cp -rfv build/${app_patch_folder}/patched/OppoGallery2.apk $targetGallery 
+        cp -p -- "${targetGallery}" "tmp/$(basename "${targetGallery}").bak" || exit 1
+        apk_decode "${targetGallery}" tmp/Gallery --artifact OppoGallery2.apk ${extra_args:-} || exit 1
+        python3 bin/patchmethod_v2.py -d tmp/Gallery -k 'const-string.*"ro.product.first_api_level"' -hook '     const/16 reg, 0x22' || exit 1
+        mkdir -p "build/${app_patch_folder}/patched"
+        apk_build tmp/Gallery "build/${app_patch_folder}/patched/OppoGallery2.apk" \
+            --artifact OppoGallery2.apk ${extra_args:-} || exit 1
+        cp -p -- "build/${app_patch_folder}/patched/OppoGallery2.apk" "${targetGallery}" || exit 1
     fi
 fi
 
 if [[ ${base_device_family} == "OPSM8250" ]] || [[ ${base_device_family} == "OPSM8350" ]];then
     # Patch Battery Health Maximum capacity
-    targetBattery=$(find build/portrom/images/ -name "Battery.apk")
+    targetBattery=$(find build/portrom/images/ -type f -name "Battery.apk" -print -quit)
     if [[ -f build/${app_patch_folder}/patched/Battery.apk ]]; then
         blue "复制已经处理过的Battery"
         cp -rfv build/${app_patch_folder}/patched/Battery.apk $targetBattery
      
-    elif  [[ -f $targetBattery ]];then
+    elif [[ -f "${targetBattery}" ]]; then
         blue "Patch Battery Health Maximum capacity"
-        cp -rf $targetBattery tmp/$(basename $targetBattery).bak
-        java -jar bin/apktool/APKEditor.jar d -f -i $targetBattery -o tmp/Battery $extra_args
-        python3 bin/patchmethod_v2.py -d tmp/Battery/ -k "getUIsohValue" -m devices/common/patch_battery_soh.txt 
-        java -jar bin/apktool/APKEditor.jar b -f -i tmp/Battery -o build/${app_patch_folder}/patched/Battery.apk $extra_args
-        cp -rfv build/${app_patch_folder}/patched/Battery.apk $targetBattery 
+        cp -p -- "${targetBattery}" "tmp/$(basename "${targetBattery}").bak" || exit 1
+        apk_decode "${targetBattery}" tmp/Battery --artifact Battery.apk ${extra_args:-} || exit 1
+        battery_apk_method=$(find tmp/Battery -type f -name '*.smali' -exec grep -l 'getUIsohValue' {} \; -print -quit)
+        if [[ -n "${battery_apk_method}" ]]; then
+            python3 bin/patchmethod_v2.py -d tmp/Battery/ -k getUIsohValue -m devices/common/patch_battery_soh.txt || exit 1
+            mkdir -p "build/${app_patch_folder}/patched"
+            apk_build tmp/Battery "build/${app_patch_folder}/patched/Battery.apk" \
+                --artifact Battery.apk ${extra_args:-} || exit 1
+            cp -p -- "build/${app_patch_folder}/patched/Battery.apk" "${targetBattery}" || exit 1
+        else
+            yellow "Battery.apk 未包含 getUIsohValue，跳过应用层 SOH patch" \
+                "Battery.apk has no getUIsohValue; skipping app-level SOH patch"
+        fi
     fi
 fi 
 
-if [[ ${regionmark} != "CN" ]] && [[ ${base_product_model} != "IN20*" ]];then
+if [[ ${regionmark} != "CN" ]] && [[ ${base_product_model} != IN20* ]]; then
 
     # Charging info in Settings
-    targetSettings=$(find build/portrom/images/ -name "Settings.apk")
+    targetSettings=$(find build/portrom/images/ -type f -name "Settings.apk" -print -quit)
 
-    if [[ -f $targetSettings ]];then
+    if [[ -f "${targetSettings}" ]]; then
         blue "Charging info in Settings"
-        cp -rf $targetSettings tmp/$(basename $targetSettings).bak
-        java -jar bin/apktool/APKEditor.jar d -f -i $targetSettings -o tmp/Settings $extra_args
-        targetSmali=$(find tmp -type f -name "DeviceChargeInfoController.smali")
-        python3 bin/patchmethod_v2.py $targetSmali isPreferenceSupport
-        java -jar bin/apktool/APKEditor.jar b -f -i tmp/Settings -o $targetSettings $extra_args
+        cp -p -- "${targetSettings}" "tmp/$(basename "${targetSettings}").bak" || exit 1
+        apk_decode "${targetSettings}" tmp/Settings --artifact Settings.apk ${extra_args:-} || exit 1
+        patch_oplus_identity_settings_entry "$(find tmp/Settings -path '*/res/xml/system_settings_preference.xml' -print -quit)"
+        targetSmali=$(find tmp/Settings -type f -name "DeviceChargeInfoController.smali" -print -quit)
+        if [[ -n "${targetSmali}" ]]; then
+            python3 bin/patchmethod_v2.py "${targetSmali}" isPreferenceSupport || exit 1
+        fi
+        apk_build tmp/Settings "${targetSettings}" --artifact Settings.apk ${extra_args:-} || exit 1
     fi
 fi 
 
-targetOplusLauncher=$(find build/portrom/images/ -name "OplusLauncher.apk")
+targetOplusLauncher=$(find build/portrom/images/ -type f -name "OplusLauncher.apk" -print -quit)
 
 if [[ -f $targetOplusLauncher ]] && [[ $base_product_first_api_level -gt 34 ]];then
 	blue "解锁运存显示"
 	cp -rf $targetOplusLauncher tmp/$(basename $targetOplusLauncher).bak
 	java -jar bin/apktool/APKEditor.jar d -f -i $targetOplusLauncher -o tmp/OplusLauncher $extra_args
-	targetSmali=$(find tmp -type f -path "*/com/oplus/basecommon/util/SystemPropertiesHelper.smali")
- python3 bin/patchmethod_v2.py $targetSmali getFirstApiLevel ".locals 1\n\tconst/16 v0, 0x22\n\treturn v0"
- java -jar bin/apktool/APKEditor.jar b -f -i tmp/OplusLauncher -o $targetOplusLauncher $extra_args
+	targetSmali=$(find tmp/OplusLauncher -type f -path "*/com/oplus/basecommon/util/SystemPropertiesHelper.smali" -print -quit)
+    if [[ -n "${targetSmali}" ]]; then
+        python3 bin/patchmethod_v2.py "${targetSmali}" getFirstApiLevel ".locals 1\n\tconst/16 v0, 0x22\n\treturn v0" || exit 1
+    fi
+    apk_build tmp/OplusLauncher "${targetOplusLauncher}" --artifact OplusLauncher.apk ${extra_args:-} || exit 1
 fi
 
-targetSystemUI=$(find build/portrom/images/ -name "SystemUI.apk")
+targetSystemUI=$(find build/portrom/images/ -type f -name "SystemUI.apk" -print -quit)
 if [[ -f build/${app_patch_folder}/patched/SystemUI.apk ]]; then
         blue "复制已经处理过的SystemUI.apk"
         cp -rfv build/${app_patch_folder}/patched/SystemUI.apk $targetSystemUI
@@ -996,42 +1451,83 @@ if [[ -f build/${app_patch_folder}/patched/SystemUI.apk ]]; then
 elif [[ -f "$targetSystemUI" ]]; then
     
     cp -rf $targetSystemUI tmp/$(basename $targetSystemUI).bak
-    java -jar bin/apktool/APKEditor.jar d -f -i $targetSystemUI -o tmp/SystemUI $extra_args
+    apk_decode "${targetSystemUI}" tmp/SystemUI --artifact SystemUI.apk ${extra_args:-} || exit 1
     blue "解锁全景全屏AOD"
-    targetSmoothTransitionControllerSmali=$(find tmp/SystemUI -type f -name "SmoothTransitionController.smali")
-    python3 bin/patchmethod_v2.py "$targetSmoothTransitionControllerSmali" setPanoramicStatusForApplication
-    python3 bin/patchmethod_v2.py "$targetSmoothTransitionControllerSmali" setPanoramicSupportAllDayForApplication
+    targetSmoothTransitionControllerSmali=$(find tmp/SystemUI -type f -name "SmoothTransitionController.smali" -print -quit)
+    if [[ -n "${targetSmoothTransitionControllerSmali}" ]]; then
+        python3 bin/patchmethod_v2.py "${targetSmoothTransitionControllerSmali}" setPanoramicStatusForApplication || exit 1
+        python3 bin/patchmethod_v2.py "${targetSmoothTransitionControllerSmali}" setPanoramicSupportAllDayForApplication || exit 1
+    fi
 
-    targetAODDisplayUtilSmali=$(find tmp/SystemUI -type f -name "AODDisplayUtil.smali")
-    python3 bin/patchmethod_v2.py "$targetAODDisplayUtilSmali" isPanoramicProcessTypeNotSupportAllDay -return false
+    targetAODDisplayUtilSmali=$(find tmp/SystemUI -type f -name "AODDisplayUtil.smali" -print -quit)
+    if [[ -n "${targetAODDisplayUtilSmali}" ]]; then
+        python3 bin/patchmethod_v2.py "${targetAODDisplayUtilSmali}" isPanoramicProcessTypeNotSupportAllDay -return false || exit 1
+        python3 bin/patchmethod_v2.py "${targetAODDisplayUtilSmali}" isPanoramicProcessTypeInEnergySaveSituation -return false || exit 1
+    fi
     if [[ $base_product_first_api_level -gt 34 ]];then
-    targetStatusBarFeatureOptionSmali=$(find tmp/SystemUI -type f -name "StatusBarFeatureOption.smali")
-    python3 bin/patchmethod_v2.py "$targetStatusBarFeatureOptionSmali" isChargeVoocSpecialColorShow -return true
+    targetStatusBarFeatureOptionSmali=$(find tmp/SystemUI -type f -name "StatusBarFeatureOption.smali" -print -quit)
+    if [[ -n "${targetStatusBarFeatureOptionSmali}" ]]; then
+        python3 bin/patchmethod_v2.py "${targetStatusBarFeatureOptionSmali}" isChargeVoocSpecialColorShow -return true || exit 1
+    fi
     fi
     if [[ $regionmark != "CN" ]];then
         blue "解锁MyDevice"
-        targetSmali=$(find tmp -type f -name "FeatureOption.smali")
-        python3 bin/patchmethod_v2.py $targetSmali isSupportMyDevice
+        targetSmali=$(find tmp/SystemUI -type f -name "FeatureOption.smali" -print -quit)
+        if [[ -n "${targetSmali}" ]]; then
+            python3 bin/patchmethod_v2.py "${targetSmali}" isSupportMyDevice || exit 1
+        fi
     fi
     # tmp workround 
     for style_xml_file in $(find tmp/SystemUI -name "styles.xml");do 
         sed -i "s/style\/null/7f1403f6/g" $style_xml_file
     done
-    java -jar bin/apktool/APKEditor.jar b -f -i tmp/SystemUI -o build/${app_patch_folder}/patched/SystemUI.apk $extra_args
-    cp -rfv build/${app_patch_folder}/patched/SystemUI.apk $targetSystemUI
+    mkdir -p "build/${app_patch_folder}/patched"
+    apk_build tmp/SystemUI "build/${app_patch_folder}/patched/SystemUI.apk" \
+        --artifact SystemUI.apk ${extra_args:-} || exit 1
+    cp -p -- "build/${app_patch_folder}/patched/SystemUI.apk" "${targetSystemUI}" || exit 1
 fi
 
-targetAOD=$(find build/portrom/images/ -name "Aod.apk")
+targetAOD=$(find build/portrom/images/ -type f -name "Aod.apk" -print -quit)
 
 if [[ -f $targetAOD ]] && [[ $base_product_first_api_level -le 35 ]] ;then
 	blue "强制开启老机型AOD全天候息屏功能"
 	cp -rf $targetAOD tmp/$(basename $targetAOD).bak
-	java -jar bin/apktool/APKEditor.jar d -f -i $targetAOD -o tmp/Aod $extra_args
-	targetCommonUtilsSmali=$(find tmp -type f -path "*/com/oplus/aod/util/CommonUtils.smali")
-    targetSettingsSmali=$(find tmp -type f -path "*/com/oplus/aod/util/SettingsUtils.smali")
-    python3 bin/patchmethod_v2.py $targetCommonUtilsSmali isSupportFullAod -return true
-    python3 bin/patchmethod_v2.py $targetSettingsSmali getKeyAodAllDaySupportSettings -return true
-    java -jar bin/apktool/APKEditor.jar b -f -i tmp/Aod -o $targetAOD $extra_args
+    apk_decode "${targetAOD}" tmp/Aod --artifact Aod.apk ${extra_args:-} || exit 1
+    targetCommonUtilsSmali=$(find tmp/Aod -type f -path "*/com/oplus/aod/util/CommonUtils.smali" -print -quit)
+    targetSettingsSmali=$(find tmp/Aod -type f -path "*/com/oplus/aod/util/SettingsUtils.smali" -print -quit)
+    if [[ -n "${targetCommonUtilsSmali}" ]]; then
+        python3 bin/patchmethod_v2.py "${targetCommonUtilsSmali}" isSupportFullAod -return true || exit 1
+        # ColorOS 16.1 gates the inspiration-continuity AOD picker on a
+        # per-user secure setting that older bases never seed.  Keep the
+        # explicit disable-feature predicate intact and only force the
+        # capability read when this marker is present.
+        if [[ ${port_android_version:-0} -ge 16 ]] && \
+           grep -qF 'oplus_keyguard_workshop_aod_support' "${targetCommonUtilsSmali}"; then
+            python3 bin/patch_inspiration_aod_gate.py "${targetCommonUtilsSmali}" || exit 1
+        fi
+    fi
+    if [[ -n "${targetSettingsSmali}" ]]; then
+        python3 bin/patchmethod_v2.py "${targetSettingsSmali}" getKeyAodAllDaySupportSettings -return true || exit 1
+    fi
+    apk_build tmp/Aod "${targetAOD}" --artifact Aod.apk ${extra_args:-} || exit 1
+fi
+
+# Wallpapers contains a second copy of the ColorOS 16.1 workshop-AOD gate.
+# Patch it only when the marker is present so older builds remain untouched.
+targetWallpapers=$(find build/portrom/images/ -type f -name "Wallpapers.apk" -print -quit)
+if [[ -f "${targetWallpapers}" ]] && [[ ${port_android_version:-0} -ge 16 ]] && \
+   grep -aFq 'oplus_keyguard_workshop_aod_support' "${targetWallpapers}"; then
+    cp -p -- "${targetWallpapers}" "tmp/$(basename "${targetWallpapers}").bak" || exit 1
+    apk_decode "${targetWallpapers}" tmp/Wallpapers --artifact Wallpapers.apk ${extra_args:-} || exit 1
+    targetWallpapersGateSmali=$(find tmp/Wallpapers -type f -path '*/com/oplus/wallpapers/rely/utils/m$z.smali' -print -quit)
+    if [[ -n "${targetWallpapersGateSmali}" ]] && \
+       grep -qF 'oplus_keyguard_workshop_aod_support' "${targetWallpapersGateSmali}"; then
+        python3 bin/patch_inspiration_aod_gate.py "${targetWallpapersGateSmali}" || exit 1
+        apk_build tmp/Wallpapers "${targetWallpapers}" --artifact Wallpapers.apk ${extra_args:-} || exit 1
+    else
+        yellow "Wallpapers.apk 未找到可识别的灵感AOD门控，保留原文件" \
+            "Wallpapers.apk has no recognizable inspiration-AOD gate; keeping its original logic"
+    fi
 fi
 yellow "删除多余的App" "Debloating..." 
 # List of apps to be removed
@@ -1055,7 +1551,11 @@ elif [[ $super_extended == "false" ]] && [[ $pack_method == "stock" ]] && [[ -f 
         app_name=$(basename "$delapp")
 
         # Check if the app is in kept_apps, skip if true
-        if [[ " ${kept_apps[@]} " =~ " ${app_name} " ]]; then
+        keep_app=false
+        for kept_app in "${kept_apps[@]}"; do
+            [[ "${app_name}" == "${kept_app}" ]] && keep_app=true && break
+        done
+        if [[ "${keep_app}" == true ]]; then
             echo "Skipping kept app: $app_name"
         continue
         fi
@@ -1186,7 +1686,7 @@ for i in $(find build/portrom/images -type f -name "build.prop");do
 done
 
 sed -i "s/ro.vendor.oplus.market.name=.*/ro.vendor.oplus.market.name=${base_market_name}/g" build/portrom/images/my_product/etc/bruce/build.prop
-sed -i "s/ro.vendor.oplus.market.enname=.*/ro.vendor.oplus.market.enname=${base_market_name}/g" build/portrom/images/my_product/etc/bruce/build.prop
+sed -i "s/ro.vendor.oplus.market.enname=.*/ro.vendor.oplus.market.enname=${base_market_enname}/g" build/portrom/images/my_product/etc/bruce/build.prop
 
 remove_prop_v2 "persist.oplus.software.audio.right_volume_key"
 remove_prop_v2 "persist.oplus.software.alertslider.location"
@@ -1205,10 +1705,12 @@ base_rom_density=$(grep "ro.sf.lcd_density" --include="*.prop" -r build/baserom/
 #         echo "ro.sf.lcd_density=${base_rom_density}" >> build/portrom/images/my_product/build.prop
 # fi
 
-# brand require lowercase 
-if [[ ${base_vendor_brand,,} != ${port_vendor_brand,,} ]] && [[ $portIsColorOSGlobal == false ]] && [[ $port_android_version -lt 16 ]];then
+# brand require lowercase
+base_vendor_brand_lower="$(_port::lower "${base_vendor_brand}")"
+port_vendor_brand_lower="$(_port::lower "${port_vendor_brand}")"
+if [[ ${base_vendor_brand_lower} != ${port_vendor_brand_lower} ]] && [[ $portIsColorOSGlobal == false ]] && [[ $port_android_version -lt 16 ]];then
     # Global ColorOS needs to be Oppo brand or stuck on 
-    sed -i "s/ro.oplus.image.system_ext.brand=.*/ro.oplus.image.system_ext.brand=${base_vendor_brand,,}/g" build/portrom/images/system_ext/etc/build.prop
+    sed -i "s/ro.oplus.image.system_ext.brand=.*/ro.oplus.image.system_ext.brand=${base_vendor_brand_lower}/g" build/portrom/images/system_ext/etc/build.prop
 fi
 
 # fix bootloop
@@ -1253,38 +1755,72 @@ else
     sed -i '/^ro.build.version.oplusrom.display=/ s/$/ | Ported By 🅱🆃/' build/portrom/images/my_product/etc/bruce/build.prop
 fi
 
-if [[ $portIsRealmeUI == true ]];then
+if [[ $portIsRealmeUI == true ]]; then
     case $port_android_version in
         16) rui_version=7.0;;
         15) rui_version=6.0;;
         14) rui_version=5.0;;
+        *) rui_version="";;
     esac
-    echo "ro.build.version.realmeui=$rui_version" >> build/portrom/images/my_product/etc/bruce/build.prop
+    if [[ -n "${rui_version}" ]] && ! grep -qF "ro.build.version.realmeui=${rui_version}" \
+        build/portrom/images/my_product/etc/bruce/build.prop 2>/dev/null; then
+        echo "ro.build.version.realmeui=${rui_version}" >> build/portrom/images/my_product/etc/bruce/build.prop
+    fi
 
 fi
 
 propfile="build/portrom/images/my_product/etc/bruce/build.prop"
 
-if [[ $portIsColorOSGlobal == true ]]; then
-    MODEL_MAGIC="CPH2659,BRAND:OPPO"
-    MODEL_AIUNIT="CPH2659,BRAND:OPPO"
-
-elif [[ $portIsOOS == true ]]; then
-    MODEL_MAGIC="CPH2659,BRAND:OPPO"
-    MODEL_AIUNIT="CPH2745,BRAND:OnePlus"
-
-else
-    MODEL_MAGIC="PLK110,BRAND:OnePlus"
-    MODEL_AIUNIT="PLK110,BRAND:OnePlus"
+# PropsHook now stores per-app rules in Settings.Global.  Predeclaring the old
+# persist.oplus.* entries consumes the small Android property area and can
+# prevent unrelated system_server properties from being created.  Remove only
+# rules emitted by older builds; explicit user-managed properties are left
+# untouched.
+if [[ -f "${propfile}" ]]; then
+    sed -i -E \
+        -e '/^persist\.sys\.prophook\.com\.oplus\.(ai\.magicstudio|aiunit)=/d' \
+        -e '/^persist\.oplus\.prophook\.com\.oplus\.(ai\.magicstudio|aiunit)=/d' \
+        -e '/^persist\.sys\.prophook\.com\.coloros\.smartsidebar=/d' \
+        -e '/^persist\.oplus\.prophook\.com\.coloros\.smartsidebar=/d' \
+        "${propfile}"
 fi
 
-{
-    echo "persist.oplus.prophook.com.oplus.ai.magicstudio=MODEL:${MODEL_MAGIC}"
-    echo "persist.oplus.prophook.com.oplus.aiunit=MODEL:${MODEL_AIUNIT}"
-} >> "$propfile"
+if [[ "${stock_is_tablet}" == false && "${port_is_tablet}" == true ]]; then
+    blue "检测到跨平板模式移植，删除平板属性" "Cross-tablet mode detected, removing tablet properties"
+    remove_prop_v2 "ro.oplus.vpp.device.type" force
+    remove_prop_v2 "ro.build.characteristics" force
+    remove_prop_v2 "ro.panel.pad" force
+    remove_prop_v2 "ro.oplus.vrr.pencil.support"
+    remove_prop_v2 "ro.audio.tablet.mic_type"
+    remove_prop_v2 "persist.settings.large_screen_opt.enabled"
+    remove_prop_v2 "ro.oplus.tablet"
+    remove_prop_v2 "ro.vendor.radio.noril"
+    remove_prop_v2 "ro.radio.noril"
+    add_feature_v2 app_feature "com.android.launcher.TASKBAR_ENABLE"
+    add_feature_v2 app_feature "com.oplus.aimemory.mind_map_enable"
+    add_feature_v2 permission_feature "oplus.software.ai_key_multi_enable"
+    remove_feature "oplus.hardware.type.tablet"
 
-if [[ $port_vendor_brand == "realme" ]];then
-    echo "persist.oplus.prophook.com.coloros.smartsidebar=\"BRAND:realme\"" >> "$propfile"
+    # Phone-compatible framework APKs are safer than carrying tablet overlays
+    # across an otherwise phone base.
+    for apk_name in Aod.apk PhoneManager.apk OplusBootReg.apk; do
+        baserom_apk=$(find build/baserom/images -type f -name "${apk_name}" -print -quit)
+        if [[ -n "${baserom_apk}" ]]; then
+            baserom_apk_dir=$(dirname "${baserom_apk}")
+            portrom_apk_dir="${baserom_apk_dir/build\/baserom\/images/build\/portrom\/images}"
+            mkdir -p "${portrom_apk_dir}"
+            cp -p -- "${baserom_apk}" "${portrom_apk_dir}/" || exit 1
+        fi
+    done
+    for apk_name in StudyCenter.apk PadConnect.apk PCEngine.apk HotGamesFolder.apk WpsLauncher.apk; do
+        portrom_apk=$(find build/portrom/images -type f -name "${apk_name}" -print -quit)
+        [[ -n "${portrom_apk}" ]] || continue
+        apk_dir=$(dirname "${portrom_apk}")
+        case "$(basename "${apk_dir}")" in
+            app|priv-app|del-app) rm -f -- "${portrom_apk}" || exit 1 ;;
+            *) rm -rf -- "${apk_dir}" || exit 1 ;;
+        esac
+    done
 fi
 remove_prop_v2 "ro.oplus.resolution"
 remove_prop_v2 "ro.oplus.display.wm_size_resolution_switch.support"
@@ -1304,7 +1840,7 @@ remove_prop_v2 "ro.oplus.mtk"
 remove_prop_v2 "persist.sys.oplus.wlan.atpc.qcom_use_iw"
 
 remove_prop_v2 "ro.product.oplus.cpuinfo"
-remove_prop_v2
+remove_prop_v2 "ro.product.oplus.device"
 if [[ $base_android_version -lt 15 ]] && [[ $port_android_version -gt 15 ]];then
     remove_prop_v2 "ro.lcd.display.screen" 
     remove_prop_v2 "ro.display.brightness"
@@ -1407,7 +1943,7 @@ oplus_features=(
     "oplus.software.radio.hfp_comm_shared_support"
 )
 
-for oplus_feature in ${oplus_features[@]}; do 
+for oplus_feature in "${oplus_features[@]}"; do
     add_feature_v2 oplus_feature $oplus_feature
 done
 
@@ -1494,7 +2030,7 @@ app_features=(
     "com.oplus.aipaint.function_switch^^args=\"boolean:true\""
 
 )
-for app_feature in ${app_features[@]}; do 
+for app_feature in "${app_features[@]}"; do
     add_feature_v2 app_feature $app_feature
 done
 
@@ -1582,7 +2118,7 @@ if [[ $port_vendor_brand == "realme" ]] && [[ $regionmark == "CN" ]] ;then
     add_feature_v2 oplus_feature "oplus.software.support.gt.mode^GT模式" 
     add_feature_v2 app_feature "com.android.settings.device_rm^Realme设备，显示GT模式需要"
     add_feature_v2 app_feature "com.oplus.smartsidebar.space.roulette.support^AI传送门" \
-            "com.oplus.smartsidebar.space.roulette.bootreg" \ 
+            "com.oplus.smartsidebar.space.roulette.bootreg" \
             "com.coloros.support_gt_boost^^args=\"boolean:true\""
     add_feature_v2 permission_oplus_feature "oplus.software.aigc_global_drag" "oplus.software.smart_loop_drag"
 
@@ -1872,7 +2408,7 @@ else
         remove_feature "oplus.software.aon_sensorhub_enable" 
 
     fi
-    if [[ ! -f build/baserom/images/my_product/overlay/aon*.apk ]] && [[ $regionmark == "CN" ]];then
+    if ! compgen -G "build/baserom/images/my_product/overlay/aon*.apk" >/dev/null && [[ $regionmark == "CN" ]];then
         rm -rfv build/portrom/images/my_product/overlay/aon*.apk
     fi
 fi
@@ -2214,7 +2750,7 @@ if [[ ${port_android_version} == 17 ]];then
             sed -E -i 's#(<bool[[:space:]]+name="config_wifiChannelUtilizationOverrideEnabled">)[^<]*(</bool>)#\1true\2#' "${bool_file}"
             grep -Eq '<bool[[:space:]]+name="config_wifiChannelUtilizationOverrideEnabled">true</bool>' "${bool_file}" || { error "写入 Wi-Fi 兼容值失败" "Failed to set Wi-Fi bool"; exit 1; }
             java -jar bin/apktool/apktool.jar b -f -p "${a17_tmp}/framework" -o "${a17_tmp}/OplusWifiResource-unsigned.apk" "${a17_tmp}/OplusWifiResource" || { error "重编译 OplusWifiResource 失败" "Failed to rebuild OplusWifiResource"; exit 1; }
-            otatools/bin/apksigner sign --in "${a17_tmp}/OplusWifiResource-unsigned.apk" --out "${a17_tmp}/OplusWifiResource-signed.apk" --key key/testkey.pk8 --cert key/testkey.x509.pem --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true || { error "签名 OplusWifiResource 失败" "Failed to sign OplusWifiResource"; exit 1; }
+            otatools/bin/apksigner sign --in "${a17_tmp}/OplusWifiResource-unsigned.apk" --out "${a17_tmp}/OplusWifiResource-signed.apk" --key otatools/key/testkey.pk8 --cert otatools/key/testkey.x509.pem --v1-signing-enabled true --v2-signing-enabled true --v3-signing-enabled true || { error "签名 OplusWifiResource 失败" "Failed to sign OplusWifiResource"; exit 1; }
             otatools/bin/apksigner verify --verbose "${a17_tmp}/OplusWifiResource-signed.apk" || { error "签名验证失败" "Signature verification failed"; exit 1; }
             cp -p "${a17_tmp}/OplusWifiResource-signed.apk" "${wifi_rro}"
             green "OplusWifiResource.apk 修复并签名完成" "OplusWifiResource.apk rebuilt and signed"
@@ -2250,73 +2786,142 @@ if ensure_resource_available "devices/${base_product_device}/odm_selinux_fix_a16
     unzip -o devices/${base_product_device}/odm_selinux_fix_a16.zip -d ${work_dir}/build/portrom/images/
 fi
 
-for zip in $(find devices/${base_product_device}/ -name "*.zip"); do
-    if unzip -l $zip | grep -q "anykernel.sh" ;then
-        blue "检查到第三方内核压缩包 $zip [AnyKernel类型]" "Custom Kernel zip $zip detected [Anykernel]"
-        if echo $zip | grep -q ".*-KSU" ; then
-          unzip $zip -d tmp/anykernel-ksu/ > /dev/null 2>&1
-        elif echo $zip | grep -q ".*-NoKSU" ; then
-          unzip $zip -d tmp/anykernel-noksu/ > /dev/null 2>&1
+anykernel_device_dir="${work_dir}/devices/${base_product_device}"
+_port::clear_anykernel_outputs "${anykernel_device_dir}" || exit 1
+
+# Kernel integration is opt-in.  A stale boot_ksu/boot_noksu artifact from an
+# earlier run must never be selected when enable_ksu is false.
+if [[ "${enable_ksu}" == "true" ]]; then
+    blue "启用 KernelSU 支持..." "Enabling KernelSU support..."
+    mkdir -p "${work_dir}/tmp" "${anykernel_device_dir}" || exit 1
+    rm -rf -- \
+        "${work_dir}/tmp/anykernel" \
+        "${work_dir}/tmp/anykernel-ksu" \
+        "${work_dir}/tmp/anykernel-noksu"
+
+    while IFS= read -r -d '' zip; do
+        if unzip -l "${zip}" | grep -q "anykernel.sh"; then
+            blue "检查到第三方内核压缩包 ${zip} [AnyKernel类型]" "Custom Kernel zip ${zip} detected [Anykernel]"
+            anykernel_variant="$(_port::anykernel_variant_for_zip "${zip}")"
+            if ! unzip -qo "${zip}" -d "${work_dir}/tmp/anykernel-${anykernel_variant}" > /dev/null 2>&1; then
+                yellow "AnyKernel 压缩包解压失败，跳过 ${zip}" "Failed to extract AnyKernel archive; skipping ${zip}"
+                rm -rf -- "${work_dir}/tmp/anykernel-${anykernel_variant}"
+            fi
+        fi
+    done < <(find "${work_dir}/devices/${base_product_device}/" -type f -name "*.zip" -print0)
+
+    for anykernel_dir in \
+        "${work_dir}/tmp/anykernel" \
+        "${work_dir}/tmp/anykernel-ksu" \
+        "${work_dir}/tmp/anykernel-noksu"; do
+        if [[ -d "${anykernel_dir}" ]]; then
+            blue "开始整合第三方内核进boot.img" "Start integrating custom kernel into boot.img"
+            kernel_file=$(find "${anykernel_dir}" -type f -name "Image" -print -quit)
+            dtb_file=$(find "${anykernel_dir}" -type f -name "dtb" -print -quit)
+            dtbo_img=$(find "${anykernel_dir}" -type f -name "dtbo.img" -print -quit)
+            if [[ -z "${kernel_file}" || ! -f "${kernel_file}" ]]; then
+                yellow "AnyKernel 压缩包缺少 Image，跳过内核整合" "AnyKernel archive has no Image; skipping kernel integration"
+                rm -rf -- "${anykernel_dir}"
+                continue
+            fi
+            if [[ "${anykernel_dir}" == *"-ksu" ]]; then
+                [[ -f "${dtbo_img}" ]] && cp -f -- "${dtbo_img}" "${anykernel_device_dir}/dtbo_ksu.img"
+                patch_kernel "${kernel_file}" "${dtb_file}" "boot_ksu.img"
+                blue "生成内核boot_ksu.img完毕" "New boot_ksu.img generated"
+            elif [[ "${anykernel_dir}" == *"-noksu" ]]; then
+                [[ -f "${dtbo_img}" ]] && cp -f -- "${dtbo_img}" "${anykernel_device_dir}/dtbo_noksu.img"
+                patch_kernel "${kernel_file}" "${dtb_file}" "boot_noksu.img"
+                blue "生成内核boot_noksu.img" "New boot_noksu.img generated"
+            else
+                [[ -f "${dtbo_img}" ]] && cp -f -- "${dtbo_img}" "${anykernel_device_dir}/dtbo_custom.img"
+                patch_kernel "${kernel_file}" "${dtb_file}" "boot_custom.img"
+                blue "生成内核boot_custom.img完毕" "New boot_custom.img generated"
+            fi
+        fi
+        [[ -d "${anykernel_dir}" ]] && rm -rf -- "${anykernel_dir}"
+    done
+
+    # Determine the target image and KMI before invoking the modern KSU
+    # helpers.  They perform their own unpack/repack checks and leave the
+    # original image untouched on failure.
+    ksu_target_img=""
+    if [[ -f "${work_dir}/build/baserom/images/init_boot.img" ]]; then
+        ksu_target_img="${work_dir}/build/baserom/images/init_boot.img"
+    elif [[ -f "${work_dir}/build/baserom/images/boot.img" ]]; then
+        ksu_target_img="${work_dir}/build/baserom/images/boot.img"
+    elif [[ -f "${work_dir}/build/baserom/boot.img" ]]; then
+        ksu_target_img="${work_dir}/build/baserom/boot.img"
+    fi
+
+    if [[ -z "${ksu_target_img}" ]]; then
+        yellow "未找到 init_boot.img 或 boot.img，跳过 KSU 修补" "Neither init_boot.img nor boot.img found, skipping KSU patch"
+    else
+        if [[ -z "${kmi:-}" ]]; then
+            kmi=""
+            while IFS= read -r prop; do
+                kernel_id=$(grep -E '^ro.build.kernel.id=' "${prop}" | cut -d= -f2)
+                [[ -n "${kernel_id}" ]] && break
+            done < <(find "${work_dir}/build/portrom/images" -type f -name "build.prop")
+            kernel_major=$(printf '%s' "${kernel_id:-}" | grep -Eo '^[0-9]+\.[0-9]+' || true)
+            case "${kernel_major}" in
+                6.1)  kmi="android14-6.1" ;;
+                6.6)  kmi="android15-6.6" ;;
+                6.12) kmi="android16-6.12" ;;
+            esac
+        fi
+        if [[ -z "${kmi}" ]] && analyze_kmi_from_boot "${ksu_target_img}"; then
+            kmi="${PORT_KMI_RESULT:-}"
+        fi
+        if [[ -z "${kmi}" ]]; then
+            yellow "无法确定 KMI 版本，跳过 KSU 修补" "Could not determine KMI version, skipping KSU patch"
+        elif ! is_kmi_ksu_supported "${kmi}"; then
+            yellow "KMI ${kmi} 不支持 KernelSU，跳过 KSU 集成" "KMI ${kmi} does not support KernelSU; skipping integration"
+        elif prepare_ksu_assets "${kmi}" && apply_ksu_patch "${ksu_target_img}" "${kmi}"; then
+            green "KernelSU 集成成功" "KernelSU integration successful"
+            if [[ "${ksu_target_img}" == *"/init_boot.img" ]]; then
+                cp -f -- "${ksu_target_img}" "${work_dir}/build/baserom/images/init_boot-kernelsu.img"
+            fi
         else
-          unzip $zip -d tmp/anykernel/ > /dev/null 2>&1
+            yellow "KSU 资源准备或补丁应用失败，跳过 KSU 集成" "KSU assets or patch failed; skipping integration"
         fi
     fi
-done
-for anykernel_dir in tmp/anykernel*; do
-    if [ -d "$anykernel_dir" ]; then
-        blue "开始整合第三方内核进boot.img" "Start integrating custom kernel into boot.img"
-        kernel_file=$(find "$anykernel_dir" -name "Image" -exec readlink -f {} +)
-        dtb_file=$(find "$anykernel_dir" -name "dtb" -exec readlink -f {} +)
-        dtbo_img=$(find "$anykernel_dir" -name "dtbo.img" -exec readlink -f {} +)
-        if [[ "$anykernel_dir" == *"-ksu"* ]]; then
-            [[ -f $dtbo_img ]] && cp $dtbo_img ${work_dir}/devices/$base_product_device/dtbo_ksu.img
-            patch_kernel "$kernel_file" "$dtb_file" "boot_ksu.img"
-            blue "生成内核boot_boot_ksu.img完毕" "New boot_ksu.img generated"
-        elif [[ "$anykernel_dir" == *"-noksu"* ]]; then
-            cp $dtbo_img ${work_dir}/devices/$base_product_device/dtbo_noksu.img
-            patch_kernel "$kernel_file" "$dtb_file" "boot_noksu.img"
-            blue "生成内核boot_noksu.img" "New boot_noksu.img generated"
-        else
-            cp $dtbo_img ${work_dir}/devices/$base_product_device/dtbo_custom.img
-            patch_kernel "$kernel_file" "$dtb_file" "boot_custom.img"
-            blue "生成内核boot_custom.img完毕" "New boot_custom.img generated"
-        fi
-    fi
-    rm -rf $anykernel_dir
-done
+fi
 
+# If an externally built, locally authorized TEE-simulator payload is present,
+# materialize it before image repacking.  The public clone intentionally does
+# not ship that binary payload; absent assets are a clean no-op.
+if ! _port::stage_patch_teesim; then
+    error "TEE simulator 集成失败" "TEE simulator integration failed"
+    exit 1
+fi
 
-while IFS= read -r prop; do
-    val=$(grep -E '^ro.build.kernel.id=' "$prop" | cut -d= -f2)
-    if [ -n "$val" ]; then
-        kernel_id="$val"
-        kernel_prop="$prop"
-        break
-    fi
-done < <(find "$work_dir/build/portrom/images" -type f -name "build.prop")
+# Apply the remaining Android 16/17 post-data compatibility fixes from the
+# optimized pipeline while staying inside the remote monolithic flow.  This
+# stage is intentionally placed after device overlays and before fspatch/
+# contextpatch/repack so all generated metadata sees the final file tree.
+if ! _port::stage_postdata_compat; then
+    error "Android 16/17 开机后兼容修复失败" "Android 16/17 post-data compatibility fixes failed"
+    exit 1
+fi
 
-kernel_major=$(echo "$kernel_id" | grep -Eo '^[0-9]+\.[0-9]+')
+# Android 17 Qualcomm HIDL ports optionally use the common VNDK-30 IMS APK.
+# The helper is gated by the extracted VINTF declarations and is a no-op when
+# the release asset is unavailable or the target already exposes AIDL IMS.
+if ! _port::patch_ims_stack_for_vndk30; then
+    error "IMS 兼容修复失败" "IMS compatibility patch failed"
+    exit 1
+fi
 
-kmi=""
-case "$kernel_major" in
-    6.1)  kmi="android14-6.1" ;;
-    6.6)  kmi="android15-6.6" ;;
-    6.12) kmi="android16-6.12" ;;
-esac
-
-if [ -z "$kmi" ]; then
-    echo "⚠ 未匹配到 KMI（ro.build.kernel.id=$kernel_id），跳过 ksud 修补 init_boot"
-else
-    echo "✔ 检测到内核版本 $kernel_major → 使用 KMI: $kmi"
-    mkdir -p tmp/init_boot
-    cd tmp/init_boot
-    cp -f ${work_dir}/build/baserom/images/init_boot.img ${work_dir}/tmp/init_boot
-    ksud boot-patch \
-        -b "${work_dir}/tmp/init_boot/init_boot.img" \
-        --magiskboot magiskboot \
-        --kmi "$kmi"
-    mv -f ${work_dir}/tmp/init_boot/kernelsu_*.img ${work_dir}/build/baserom/images/init_boot-kernelsu.img
-    cd $work_dir
+# Keep the platform-specific SELinux fixes in the same monolithic repack
+# boundary. They are type-gated and no-op for unrelated devices; when a host
+# secilc is available they also refresh the ODM precompiled policy blobs.
+if ! _port::patch_performance_sepolicy; then
+    error "性能 HAL SELinux 修复失败" "Performance HAL SELinux fix failed"
+    exit 1
+fi
+if ! _port::patch_display_panel_sepolicy; then
+    error "显示面板 SELinux 修复失败" "Display panel SELinux fix failed"
+    exit 1
 fi
 
 #添加erofs文件系统fstab
@@ -2338,22 +2943,24 @@ fi
 # fi
 
 # data 加密
-remove_data_encrypt=$(grep "remove_data_encryption" bin/port_config |cut -d '=' -f 2)
+# Use the already parsed, comment-safe configuration value instead of reading
+# the file again with grep (which could accidentally match a commented line).
+remove_data_encrypt="${remove_data_encryption}"
 if [[ ${remove_data_encrypt} == "true" ]];then
     DECRYPTRD="-DECRYPTED"
     blue "去除data加密"
-    for fstab in $(find build/portrom/images -type f -name "fstab.*");do
+	while IFS= read -r -d '' fstab; do
 		blue "Target: $fstab"
-		sed -i "s/,fileencryption=aes-256-xts:aes-256-cts:v2+inlinecrypt_optimized+wrappedkey_v0//g" $fstab
-		sed -i "s/,fileencryption=aes-256-xts:aes-256-cts:v2+emmc_optimized+wrappedkey_v0//g" $fstab
-		sed -i "s/,fileencryption=aes-256-xts:aes-256-cts:v2//g" $fstab
-		sed -i "s/,metadata_encryption=aes-256-xts:wrappedkey_v0//g" $fstab
-		sed -i "s/,fileencryption=aes-256-xts:wrappedkey_v0//g" $fstab
-		sed -i "s/,metadata_encryption=aes-256-xts//g" $fstab
-		sed -i "s/,fileencryption=aes-256-xts//g" $fstab
-        sed -i "s/,fileencryption=ice//g" $fstab
-		sed -i "s/fileencryption/encryptable/g" $fstab
-	done
+		sed -i "s/,fileencryption=aes-256-xts:aes-256-cts:v2+inlinecrypt_optimized+wrappedkey_v0//g" "${fstab}"
+		sed -i "s/,fileencryption=aes-256-xts:aes-256-cts:v2+emmc_optimized+wrappedkey_v0//g" "${fstab}"
+		sed -i "s/,fileencryption=aes-256-xts:aes-256-cts:v2//g" "${fstab}"
+		sed -i "s/,metadata_encryption=aes-256-xts:wrappedkey_v0//g" "${fstab}"
+		sed -i "s/,fileencryption=aes-256-xts:wrappedkey_v0//g" "${fstab}"
+		sed -i "s/,metadata_encryption=aes-256-xts//g" "${fstab}"
+		sed -i "s/,fileencryption=aes-256-xts//g" "${fstab}"
+        sed -i "s/,fileencryption=ice//g" "${fstab}"
+		sed -i "s/fileencryption/encryptable/g" "${fstab}"
+	done < <(find build/portrom/images -type f -name "fstab.*" -print0)
 fi
 
 # for pname in ${port_partition};do
@@ -2361,30 +2968,33 @@ fi
 # done
 echo "${pack_type}">fstype.txt
 if [[ $super_extended == true ]];then
-    superSize=$(bash bin/getSuperSize.sh "others")
+    superSize=$(bash bin/getSuperSize.sh "others") || exit 1
 elif [[ $base_product_model == "KB2000" ]] && [[ "$is_ab_device" == false ]] ; then
     # OnePlus 8T A-only ROM
-    echo ro.product.cpuinfo=SM8250 >> build/portrom/images/my_manifest/build.prop
-    superSize=$(bash bin/getSuperSize.sh OnePlus9R)
+    grep -qF 'ro.product.cpuinfo=SM8250' build/portrom/images/my_manifest/build.prop 2>/dev/null || \
+        echo 'ro.product.cpuinfo=SM8250' >> build/portrom/images/my_manifest/build.prop
+    superSize=$(bash bin/getSuperSize.sh OnePlus9R) || exit 1
 elif [[ $base_product_model == "LE2101" ]]; then
     # "9R IN"
-    superSize=$(bash bin/getSuperSize.sh OnePlus8T)
+    superSize=$(bash bin/getSuperSize.sh OnePlus8T) || exit 1
 else
-    superSize=$(bash bin/getSuperSize.sh $base_product_device)
+    superSize=$(bash bin/getSuperSize.sh "${base_product_device}") || exit 1
 fi
 
 green "Super大小为${superSize}" "Super image size: ${superSize}"
 green "开始打包镜像" "Packing img"
 for pname in ${super_list};do
     if [ -d "build/portrom/images/$pname" ];then
-        if [[ "$OSTYPE" == "darwin"* ]];then
-            thisSize=$(find build/portrom/images/${pname} | xargs stat -f%z | awk ' {s+=$1} END { print s }' )
-        else
-            thisSize=$(du -sb build/portrom/images/${pname} |tr -cd 0-9)
-        fi
+        thisSize="$(port_tree_size_bytes "build/portrom/images/${pname}")" || exit 1
         blue 以[$pack_type]文件系统打包[${pname}.img] "Packing [${pname}.img] with [$pack_type] filesystem"
-        python3 bin/fspatch.py build/portrom/images/${pname} build/portrom/images/config/${pname}_fs_config
-        python3 bin/contextpatch.py build/portrom/images/${pname} build/portrom/images/config/${pname}_file_contexts
+        fs_config="build/portrom/images/config/${pname}_fs_config"
+        file_contexts="build/portrom/images/config/${pname}_file_contexts"
+        if [[ ! -f "${fs_config}" || ! -f "${file_contexts}" ]]; then
+            error "缺少 ${pname} 打包配置" "Missing ${pname} packing configuration"
+            exit 1
+        fi
+        python3 bin/fspatch.py "build/portrom/images/${pname}" "${fs_config}" || exit 1
+        python3 bin/contextpatch.py "build/portrom/images/${pname}" "${file_contexts}" || exit 1
         # contextpatch.py rebuilds vendor_file_contexts from the extracted
         # tree and drops recursive rules that do not correspond to a concrete
         # file.  Re-apply the Android 17 overlay and /dev/ion rules before
@@ -2398,14 +3008,20 @@ for pname in ${super_list};do
                 exit 1
             fi
         fi
-        #perl -pi -e 's/\\@/@/g' build/portrom/images/config/${pname}_file_contexts
-        mkfs.erofs -zlz4hc,9 --mount-point ${pname} --fs-config-file build/portrom/images/config/${pname}_fs_config --file-contexts build/portrom/images/config/${pname}_file_contexts -T 1648635685 build/portrom/images/${pname}.img build/portrom/images/${pname}
-        if [ -f "build/portrom/images/${pname}.img" ];then
-            green "成功以 [erofs] 文件系统打包 [${pname}.img]" "Packing [${pname}.img] successfully with [erofs] format"
-            #rm -rf build/portrom/images/${pname}
+        if [[ "${pack_type}" == "EXT" ]]; then
+            if ! _port::pack_partition_ext4 "${pname}" "build/portrom/images/${pname}" \
+                "${fs_config}" "${file_contexts}" "build/portrom/images/${pname}.img" "${thisSize}"; then
+                error "以 [${pack_type}] 文件系统打包 [${pname}] 分区失败" "Failed to pack [${pname}]"
+                exit 1
+            fi
+            green "成功以 [ext4] 文件系统打包 [${pname}.img]" "Packing [${pname}.img] successfully with [ext4] format"
         else
-            error "以 [${pack_type}] 文件系统打包 [${pname}] 分区失败" "Faield to pack [${pname}]"
-            exit 1
+            if ! _port::pack_partition_erofs "${pname}" "build/portrom/images/${pname}" \
+                "${fs_config}" "${file_contexts}" "build/portrom/images/${pname}.img"; then
+                error "以 [${pack_type}] 文件系统打包 [${pname}] 分区失败" "Failed to pack [${pname}]"
+                exit 1
+            fi
+            green "成功以 [erofs] 文件系统打包 [${pname}.img]" "Packing [${pname}.img] successfully with [erofs] format"
         fi
         unset fsType
         unset thisSize
@@ -2413,7 +3029,7 @@ for pname in ${super_list};do
 done
 
 
-rm fstype.txt
+rm -f -- fstype.txt
 
 if [[ ${port_vendor_brand} == "realme" ]];then
     os_type="RealmeUI"
@@ -2585,19 +3201,15 @@ if [[ $pack_method == "stock" ]];then
             cp -rf devices/common/recovery.fstab out/target/product/${base_product_device}/RECOVERY/RAMDISK/etc/
         fi
     fi
-    declare -A prop_paths=(
-    ["system"]="SYSTEM"
-    ["product"]="PRODUCT"
-    ["system_ext"]="SYSTEM_EXT"
-    ["vendor"]="VENDOR"
-    ["my_manifest"]="MY_MANIFEST"
-    )
+    prop_dirs=(system product system_ext vendor my_manifest)
+    prop_targets=(SYSTEM PRODUCT SYSTEM_EXT VENDOR MY_MANIFEST)
 
-    for dir in "${!prop_paths[@]}"; do
+    for prop_index in "${!prop_dirs[@]}"; do
+        dir="${prop_dirs[$prop_index]}"
         prop_file=$(find "build/portrom/images/$dir" -type f -name "build.prop" -not -path "*/system_dlkm/*" -not -path "*/odm_dlkm/*" -print -quit)
         
         if [ -n "$prop_file" ]; then
-            target_dir="out/target/product/${base_product_device}/${prop_paths[$dir]}"
+            target_dir="out/target/product/${base_product_device}/${prop_targets[$prop_index]}"
             if [ ! -d "$target_dir" ]; then
                 mkdir -p "$target_dir"
             fi
@@ -2610,7 +3222,8 @@ if [[ $pack_method == "stock" ]];then
     mkdir -p ${work_dir}/out/$target_folder
     ./bin/ota_from_target_files --partial= --force_minor_version 9 ${work_dir}/out/target/product/${base_product_device}/ ${work_dir}/out/${base_product_device}-ota_full-${port_rom_version}-user-${port_android_version}.0.zip
     popd
-    ziphash=$(md5sum out/${base_product_device}-ota_full-${port_rom_version}-user-${port_android_version}.0.zip |head -c 10)
+    ziphash="$(port_sha256_file "out/${base_product_device}-ota_full-${port_rom_version}-user-${port_android_version}.0.zip")" || exit 1
+    ziphash="${ziphash:0:10}"
     mv -f out/${base_product_device}-ota_full-${port_rom_version}-user-${port_android_version}.0.zip out/$target_folder/ota_full-${rom_version}-${port_product_model}-${pack_timestamp}-$regionmark-${portrom_version_security_patch}-${ziphash}.zip
 	blue "打包完成： out/$target_folder/ota_full-${rom_version}-${port_product_model}-${pack_timestamp}-$regionmark-${portrom_version_security_patch}-${ziphash}.zip"
 else
@@ -2621,7 +3234,7 @@ else
 
         for pname in ${super_list};do
             if [ -f "build/portrom/images/${pname}.img" ];then
-                subsize=$(du -sb build/portrom/images/${pname}.img |tr -cd 0-9)
+                subsize="$(port_file_size_bytes "build/portrom/images/${pname}.img")" || exit 1
                 green "Super 子分区 [$pname] 大小 [$subsize]" "Super sub-partition [$pname] size: [$subsize]"
                 args="--partition ${pname}_a:none:${subsize}:qti_dynamic_partitions_a --image ${pname}_a=build/portrom/images/${pname}.img --partition ${pname}_b:none:0:qti_dynamic_partitions_b"
                 lpargs="$lpargs $args"
@@ -2634,11 +3247,7 @@ else
         lpargs="-F --output build/portrom/images/super.img --metadata-size 65536 --super-name super --metadata-slots 2 --block-size 4096 --device super:$superSize --group=qti_dynamic_partitions:$superSize"
         for pname in ${super_list};do
             if [ -f "build/portrom/images/${pname}.img" ];then
-                if [[ "$OSTYPE" == "darwin"* ]];then
-                subsize=$(find build/portrom/images/${pname}.img | xargs stat -f%z | awk ' {s+=$1} END { print s }')
-                else
-                    subsize=$(du -sb build/portrom/images/${pname}.img |tr -cd 0-9)
-                fi
+                subsize="$(port_file_size_bytes "build/portrom/images/${pname}.img")" || exit 1
                 green "Super 子分区 [$pname] 大小 [$subsize]" "Super sub-partition [$pname] size: [$subsize]"
                 args="--partition ${pname}:none:${subsize}:qti_dynamic_partitions --image ${pname}=build/portrom/images/${pname}.img"
                 lpargs="$lpargs $args"
@@ -2702,11 +3311,13 @@ else
                 part=${fwimg}                
             fi
 
-            sed -i "/REM firmware/a \\\bin\\\windows\\\fastboot.exe flash "${part}" firmware-update\/"${fwimg}".img" out/${os_type}_${rom_version}/windows_flash_script.bat
-            sed -i "/# firmware/a fasatboot flash "${part}" firmware-update\/"${fwimg}".img" out/${os_type}_${rom_version}/mac_linux_flash_script.sh
+            sed -i "/REM firmware/a \\\bin\\\windows\\\fastboot.exe flash "${part}" firmware-update\/"${fwimg}".img || exit /B 1" out/${os_type}_${rom_version}/windows_flash_script.bat
+            sed -i "/# firmware/a fastboot flash "${part}" firmware-update\/"${fwimg}".img || exit 1" out/${os_type}_${rom_version}/mac_linux_flash_script.sh
         done
         sed -i "/_b/d" out/${os_type}_${rom_version}/META-INF/com/google/android/update-binary
         sed -i "s/_a//g" out/${os_type}_${rom_version}/META-INF/com/google/android/update-binary
+        sed -i "/_b/d" out/${os_type}_${rom_version}/mac_linux_flash_script.sh
+        sed -i "s/_a//g" out/${os_type}_${rom_version}/mac_linux_flash_script.sh
         sed -i '/^REM SET_ACTION_SLOT_A_BEGIN/,/^REM SET_ACTION_SLOT_A_END/d' out/${os_type}_${rom_version}/windows_flash_script.bat
         sed -i '/# SET_ACTION_SLOT_A_BEGIN/,/# SET_ACTION_SLOT_A_END/d' out/${os_type}_${rom_version}/mac_linux_flash_script.sh
     else
@@ -2717,18 +3328,18 @@ else
                 # Warning: If wrong xbl img has been flashed, it will cause phone hard brick, so we just skip it with fastboot mode.
                 continue
             elif [[ $fwimg == "mdm_oem_stanvbk" ]] || [[ $fwimg == "spunvm" ]] ;then
-                sed -i "/REM firmware/a \\\bin\\\windows\\\fastboot.exe flash "${fwimg}" firmware-update\/"${fwimg}".img" out/${os_type}_${rom_version}/windows_flash_script.bat
-                sed -i "/\# firmware/a fastboot flash "${fwimg}" firmware-update\/"${fwimg}".img" out/${os_type}_${rom_version}/mac_linux_flash_script.sh
+                sed -i "/REM firmware/a \\\bin\\\windows\\\fastboot.exe flash "${fwimg}" firmware-update\/"${fwimg}".img || exit /B 1" out/${os_type}_${rom_version}/windows_flash_script.bat
+                sed -i "/\# firmware/a fastboot flash "${fwimg}" firmware-update\/"${fwimg}".img || exit 1" out/${os_type}_${rom_version}/mac_linux_flash_script.sh
             elif [ "$(echo ${fwimg} |grep vbmeta)" != "" ];then
-                sed -i "/REM firmware/a \\\bin\\\windows\\\fastboot.exe --disable-verity --disable-verification flash "${fwimg}"_b firmware-update\/"${fwimg}".img" out/${os_type}_${rom_version}/windows_flash_script.bat
-                sed -i "/REM firmware/a \\\bin\\\windows\\\fastboot.exe --disable-verity --disable-verification flash "${fwimg}"_a firmware-update\/"${fwimg}".img" out/${os_type}_${rom_version}/windows_flash_script.bat
-                sed -i "/\# firmware/a fastboot --disable-verity --disable-verification flash "${fwimg}"_b firmware-update\/"${fwimg}".img" out/${os_type}_${rom_version}/mac_linux_flash_script.sh
-                sed -i "/\# firmware/a fastboot --disable-verity --disable-verification flash "${fwimg}"_a firmware-update\/"${fwimg}".img" out/${os_type}_${rom_version}/mac_linux_flash_script.sh
+                sed -i "/REM firmware/a \\\bin\\\windows\\\fastboot.exe --disable-verity --disable-verification flash "${fwimg}"_b firmware-update\/"${fwimg}".img || exit /B 1" out/${os_type}_${rom_version}/windows_flash_script.bat
+                sed -i "/REM firmware/a \\\bin\\\windows\\\fastboot.exe --disable-verity --disable-verification flash "${fwimg}"_a firmware-update\/"${fwimg}".img || exit /B 1" out/${os_type}_${rom_version}/windows_flash_script.bat
+                sed -i "/\# firmware/a fastboot --disable-verity --disable-verification flash "${fwimg}"_b firmware-update\/"${fwimg}".img || exit 1" out/${os_type}_${rom_version}/mac_linux_flash_script.sh
+                sed -i "/\# firmware/a fastboot --disable-verity --disable-verification flash "${fwimg}"_a firmware-update\/"${fwimg}".img || exit 1" out/${os_type}_${rom_version}/mac_linux_flash_script.sh
             else
-                sed -i "/REM firmware/a \\\bin\\\windows\\\fastboot.exe flash "${fwimg}"_b firmware-update\/"${fwimg}".img" out/${os_type}_${rom_version}/windows_flash_script.bat
-                sed -i "/REM firmware/a \\\bin\\\windows\\\fastboot.exe flash "${fwimg}"_a firmware-update\/"${fwimg}".img" out/${os_type}_${rom_version}/windows_flash_script.bat
-                sed -i "/\# firmware/a fastboot flash "${fwimg}"_b firmware-update\/"${fwimg}".img" out/${os_type}_${rom_version}/mac_linux_flash_script.sh
-                sed -i "/\# firmware/a fastboot flash "${fwimg}"_a firmware-update\/"${fwimg}".img" out/${os_type}_${rom_version}/mac_linux_flash_script.sh
+                sed -i "/REM firmware/a \\\bin\\\windows\\\fastboot.exe flash "${fwimg}"_b firmware-update\/"${fwimg}".img || exit /B 1" out/${os_type}_${rom_version}/windows_flash_script.bat
+                sed -i "/REM firmware/a \\\bin\\\windows\\\fastboot.exe flash "${fwimg}"_a firmware-update\/"${fwimg}".img || exit /B 1" out/${os_type}_${rom_version}/windows_flash_script.bat
+                sed -i "/\# firmware/a fastboot flash "${fwimg}"_b firmware-update\/"${fwimg}".img || exit 1" out/${os_type}_${rom_version}/mac_linux_flash_script.sh
+                sed -i "/\# firmware/a fastboot flash "${fwimg}"_a firmware-update\/"${fwimg}".img || exit 1" out/${os_type}_${rom_version}/mac_linux_flash_script.sh
             fi
         done
     fi
@@ -2742,7 +3353,7 @@ else
     sed -i "s/portversion/${port_rom_version}/g" out/${os_type}_${rom_version}/META-INF/com/google/android/update-binary
     sed -i "s/baseversion/${base_rom_version}/g" out/${os_type}_${rom_version}/META-INF/com/google/android/update-binary
     sed -i "s/andVersion/${port_android_version}/g" out/${os_type}_${rom_version}/META-INF/com/google/android/update-binary
-    sed -i "s/device_code/${base_product_device}/g" out/${os_type}_${rom_version}/META-INF/com/google/android/update-binary
+    sed -i "s/PROJECT_CODE/${base_device_code}/g" out/${os_type}_${rom_version}/META-INF/com/google/android/update-binary
 
     unix2dos out/${os_type}_${rom_version}/windows_flash_script.bat
 
@@ -2803,7 +3414,8 @@ else
     mv ${os_type}_${rom_version}.zip ../
     popd >/dev/null || exit
     pack_timestamp=$(date +"%m%d%H%M")
-    hash=$(md5sum out/${os_type}_${rom_version}.zip |head -c 10)
+    hash="$(port_sha256_file "out/${os_type}_${rom_version}.zip")" || exit 1
+    hash="${hash:0:10}"
     if [[ $pack_type == "EROFS" ]] && [[ -f out/${os_type}_${rom_version}/$ksubootimg ]];then
         pack_type="ROOT_"${pack_type}
     fi

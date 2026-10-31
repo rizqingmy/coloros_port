@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "description": "Optional donor properties for mixed ColorOS ports. Existing properties are still written normally; absent entries are skipped by PropsHook.",
+  "optional_properties": [
+    "sys.usap.enable",
+    "sys.lightos.usap.enable",
+    "sys.iopgp.enable",
+    "sys.power_off_alarm",
+    "sys.dumpenvironment.finished",
+    "sys.bootprotector.bootabnormal",
+    "sys.system_server.crash_java",
+    "sys.oplus.boot_completed.obrain_start",
+    "sys.oplus.screenshot",
+    "sys.power.screenoff.reason",
+    "sys.oplus.sqlctrl",
+    "sys.hans.enable",
+    "sys.thermal.enable",
+    "sys.oplus.nandswap.init",
+    "sys.oplus.phoenix.prepare_log",
+    "sys.oplus.shutdown.prepare_log",
+    "sys.display.vrr.vote.support"
+  ],
+  "optional_prefixes": [
+    "sys.oplus.respreload.",
+    "sys.olc."
+  ]
+}

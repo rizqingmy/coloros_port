@@ -15,14 +15,56 @@
 import hashlib
 import common
 import os
+from common import BlockDifference, EmptyImage, GetUserImage
 
 TARGET_DIR = os.getenv('OUT')
 
+# List of additional dynamic partitions that need BlockDifference updates
+# (system and vendor are handled by the generic script)
+USERIMAGE_PARTITIONS = [
+    "my_bigball",
+    "my_carrier",
+    "my_engineering",
+    "my_heytap",
+    "my_manifest",
+    "my_product",
+    "my_region",
+    "my_stock",
+    "odm",
+    "product",
+    "system_ext",
+]
+
+def GetUserImages(input_tmp, input_zip):
+  return {partition: GetUserImage(partition, input_tmp, input_zip)
+          for partition in USERIMAGE_PARTITIONS
+          if os.path.exists(os.path.join(input_tmp, "IMAGES", partition + ".img"))}
+
+def FullOTA_GetBlockDifferences(info):
+  images = GetUserImages(info.input_tmp, info.input_zip)
+  return [BlockDifference(partition, image)
+          for partition, image in sorted(images.items())]
+
+def IncrementalOTA_GetBlockDifferences(info):
+  source_images = GetUserImages(info.source_tmp, info.source_zip)
+  target_images = GetUserImages(info.target_tmp, info.target_zip)
+
+  # Use EmptyImage() as a placeholder for partitions that will be deleted.
+  for partition in source_images:
+    target_images.setdefault(partition, EmptyImage())
+
+  # Use source_images.get() because new partitions are not in source_images.
+  return [BlockDifference(partition, target_image, source_images.get(partition))
+          for partition, target_image in sorted(target_images.items())]
+
 def FullOTA_Assertions(self):
    #self.script.AppendExtra('getprop("ro.separate.soft") == "20061" || abort("E3004: This package is for \"20061\" devices; this is a \"" + getprop("ro.separate.soft") + "\".");')
+   # AOSP edify 要求 assert() 包裹表达式; OPPO 自家 update-binary 容忍裸表达式,
+   # 而 TWRP/AOSP update-binary 严格解析, 裸表达式刷机时报 "unexpected BAD" 解析错误;
+   # 故用 assert() 包裹以同时兼容两类 update-binary。
    self.script.AppendExtra(
-    'getprop("ro.separate.soft") == "20061" || '
-    'abort("E3004: This package is for \\"20061\\" devices; this is a \\"" + getprop("ro.separate.soft") + "\\".");'
+    'assert(getprop("ro.separate.soft") == "20061" || '
+    'abort("E3004: This package is for \\"20061\\" devices; this is a \\"" + getprop("ro.separate.soft") + "\\"."););'
 )
 
 def FullOTA_InstallBegin(self):
